@@ -5,23 +5,27 @@ import { initBackup } from './backup.js';
 import { load, get, subscribe, commit, seedCategories, balances, reviewCount, latestMonth, thisMonth, monthOf, priv } from './core.js';
 import { importBluecoins } from './importer.js';
 import { scheduleSync, onStatus } from './drive.js';
+import './feedback.js';
 import { cloudSchedule, cloudInit, onCloudStatus, handleOAuthReturn } from './cloud.js';
 import { home, ledger, review, accounts, reports, settings, bindLedger, bindSettings, openAccountSetup, ui, fillDeferred, tabIds, TAB_DEFS } from './screens.js';
 import { openEntry } from './entry.js';
 import { calendar, budget, cashflow, categories, outlook } from './views.js';
 import { ACT, ic, toast, $ } from './ui.js';
 import { initAppearance, applyHide, applyLook } from './appearance.js';
-import { postInterest } from './finance.js';
+import { postInterest, postDebtInterest, hasDebtInt } from './finance.js';
+import { hasRate } from './interest.js';
 import { ratesInit } from './rates.js';
 import { initGestures } from './gestures.js';
 import { bin, autoPurge } from './bin.js';
 import { analytics } from './analytics.js';
+import { investments } from './invest.js';
 import './scan.js';
 import './compare.js';
 import './loans.js';
+import './trades.js';
 import { commitQuiet } from './core.js';
 
-const routes = { home, ledger, review, accounts, reports, settings, calendar, budget, cashflow, categories, outlook, bin, analytics };
+const routes = { home, ledger, review, accounts, reports, settings, calendar, budget, cashflow, categories, outlook, bin, analytics, invest: investments };
 let lastRoute = null, pending = false;
 // remember where you were on each screen so Back returns there instead of the top
 const seen = new Map(), stack = []; let curKey = '', backTo = null;
@@ -30,10 +34,16 @@ window.addEventListener('hashchange', () => { const k = location.hash || '#/home
 
 function firstRun() {
   return `<section class="welcome">
-    <h1>Sukli</h1>
-    <p class="lede">A private money tracker for your phone. Your data stays on this device, with an optional backup to your own Google Drive.</p>
-    <label class="btn wide filebtn">Import my Bluecoins export (CSV)<input type="file" id="first-file" accept=".csv,text/csv" hidden></label>
-    <button class="btn ghost wide" data-act="start-empty">Start with an empty ledger</button>
+    <h1>Welcome to Sukli</h1>
+    <p class="lede">Sukli helps you see where your money goes, so there are fewer surprises at the end of the month. You do not need to know anything about finance. Your data stays on this phone.</p>
+    <ol class="steps3">
+      <li><b>Say where your money is.</b><span>Your wallet, a bank account, or an e-wallet like GCash or PayPay. Each one is called an <em>account</em>. Type how much is in it today.</span></li>
+      <li><b>Write down what you spend and earn.</b><span>Tap the round <b>+</b> button each time you pay for something or get paid. Each one is called an <em>entry</em>. It takes a few seconds.</span></li>
+      <li><b>Look at Home.</b><span>You will see what came in, what went out, and which kind of spending is biggest.</span></li></ol>
+    <button class="btn wide" data-act="start-empty">Start: add my first account</button>
+    <p class="hint center">Takes about a minute. You can change everything later.</p>
+    <div class="or"><span>already use another app?</span></div>
+    <label class="btn ghost wide filebtn">I use Bluecoins: import my CSV file<input type="file" id="first-file" accept=".csv,text/csv" hidden></label>
     <p class="hint">Importing keeps your accounts, balances, categories and every entry, including transfers between currencies.</p></section>`;
 }
 ACT['start-empty'] = () => { commit((d) => seedCategories(d)); ACT['acct-new'](); };
@@ -92,9 +102,9 @@ export function showLatest() {
 }
 // post any interest days that have passed (no-op unless an account has a rate)
 function runInterest() {
-  if (!get().accounts.some((a) => !a.deleted && a.apy > 0)) return;
+  if (!get().accounts.some((a) => !a.deleted && (hasRate(a) || hasDebtInt(a)))) return;
   let n = 0;
-  commitQuiet((d) => { n = postInterest(d).length; });
+  commitQuiet((d) => { n = postInterest(d).length + postDebtInterest(d).length; });
   return n;
 }
 const queue = () => { if (!pending) { pending = true; requestAnimationFrame(render); } };
@@ -108,6 +118,12 @@ const queue = () => { if (!pending) { pending = true; requestAnimationFrame(rend
   showLatest();
   subscribe(() => { queue(); scheduleSync(); cloudSchedule(); });
   window.addEventListener('hashchange', queue);
+  // tapping the tab you are already on takes you back to the top of it
+  document.getElementById('tabs').addEventListener('click', (e) => {
+    const a = e.target.closest('a[href^="#/"]'); if (!a) return;
+    const here = (location.hash || '#/home').split('?')[0], to = a.getAttribute('href').split('?')[0];
+    if (here === to || (here === '#/' && to === '#/home')) { e.preventDefault(); window.scrollTo({ top: 0, behavior: 'smooth' }); }
+  });
   window.addEventListener('sukli-render', queue);
   window.addEventListener('sukli-latest', () => { showLatest(); queue(); });
   onStatus((s) => { const el = document.getElementById('syncstatus'); if (el) el.textContent = s.text; });
@@ -116,14 +132,25 @@ const queue = () => { if (!pending) { pending = true; requestAnimationFrame(rend
   if (window.visualViewport) {
     const vv = window.visualViewport, root = document.documentElement;
     const fit = () => { const kb = window.innerHeight - vv.height > 120; root.classList.toggle('kb', kb); root.style.setProperty('--vvh', vv.height + 'px'); root.style.setProperty('--vvt', vv.offsetTop + 'px'); };
+    // iPhone: while a field on the page (Settings, filters) has the keyboard open, the bottom tabs would ride up the screen. Hide them until the keyboard is gone, then put the page back at its true position.
+    const editable = (el) => !!(el && el.matches && el.matches('input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=file]),textarea,select'));
+    let typingTimer = 0;
+    const settle = () => { clearTimeout(typingTimer); typingTimer = setTimeout(() => { if (editable(document.activeElement)) return; root.classList.remove('typing'); try { window.scrollTo(window.scrollX, window.scrollY); } catch { /* old browser */ } fit(); const t = document.querySelector('.tabs'); if (t) { t.style.transform = 'translateZ(0)'; requestAnimationFrame(() => { t.style.transform = ''; }); } }, 200); };
+    document.addEventListener('focusin', (e) => { if (editable(e.target) && !e.target.closest('.sheet')) { clearTimeout(typingTimer); root.classList.add('typing'); } });
+    document.addEventListener('focusout', settle);
+    vv.addEventListener('resize', () => { if (!root.classList.contains('typing') || !editable(document.activeElement)) settle(); });
     vv.addEventListener('resize', fit); vv.addEventListener('scroll', fit); fit();
-    document.addEventListener('focusin', (e) => { if (e.target && e.target.closest && e.target.closest('.sheet')) setTimeout(() => { try { e.target.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch { /* old browser */ } }, 250); });
+    // bring a field into view only when it is really hidden (by the keyboard or the edge), and without animation: a smooth scroll while the iPhone keyboard opens leaves taps landing one row off
+    document.addEventListener('focusin', (e) => { if (e.target && e.target.closest && e.target.closest('.sheet')) setTimeout(() => { try { const t = e.target, r = t.getBoundingClientRect(), sb = t.closest('.sheet-body'), sr = sb ? sb.getBoundingClientRect() : { top: 0, bottom: innerHeight };
+      const bottom = Math.min(vv.offsetTop + vv.height, sr.bottom) - 64, top = Math.max(sr.top, vv.offsetTop) + 4;
+      if (r.top >= top && r.bottom <= bottom) return; t.scrollIntoView({ block: 'nearest', behavior: 'auto' }); } catch { /* old browser */ } }, 250); });
   }
   render();
   if (oauthMsg) toast(oauthMsg, { ms: 9000 });
   cloudInit();
   ratesInit(); initGestures(); autoPurge();
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && runInterest()) queue(); });
+  setInterval(() => { try { if (document.visibilityState === 'visible' && new Date().getHours() === 23 && new Date().getMinutes() >= 55 && runInterest()) queue(); } catch { /* try again next minute */ } }, 60000);
   window.sukli = { get, commit, openEntry, ui, balancesNow: () => balances(get()) };
   if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
     navigator.serviceWorker.register('sw.js').catch(() => {});

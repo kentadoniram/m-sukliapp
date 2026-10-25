@@ -1,11 +1,13 @@
 // Receipt scanner: photo -> text (Tesseract in the browser, nothing uploaded) -> parseReceipt -> you confirm -> new entry.
 import { get, commitQuiet } from './core.js';
 import { esc, ic, ACT, sheet, toast } from './ui.js';
-import { modelFor, openEntry } from './entry.js';
+import { modelFor, openEntry, openCategoryForm } from './entry.js';
+import { enhanceSelect } from './picker.js';
 import { predict } from './predict.js';
-import { parseReceipt, parseBoth, linesFromOcr, joinLines } from './receipt.js';
+import { parseReceipt, parseBoth, linesFromOcr, joinLines, weakNames } from './receipt.js';
 import { guessItemCat, itemCatIndex, learnItemCat } from './itemcat.js';
 import { prepareReceipt } from './receiptimg.js';
+import { glossLine } from './jpgloss.js';
 
 // how readable a trial reading is: confident lines, counted in digits, kana and kanji
 const readable = (lines) => lines.reduce((n, l) => n + Math.max(0, ((l.conf ?? 50) - 40) / 60) * ((l.text.match(/[\d\u3040-\u30ff\u4e00-\u9fff]/g) || []).length), 0);
@@ -92,9 +94,9 @@ function render(api) {
     <div class="row2"><div class="field"><span>Date ${a.date ? badge(a.dateConf) : '<span class="conf lo">not found</span>'}</span><input id="sc-date" type="date" value="${esc(a.date)}"></div>
       <div class="field"><span>Time</span><input id="sc-time" type="time" value="${esc(a.time)}"></div></div>
     <div class="field"><span>Total ${a.r.total ? badge(a.totalConf) : '<span class="conf lo">not found</span>'}</span><input id="sc-total" inputmode="decimal" value="${a.total || ''}" autocomplete="off">
-      ${a.r.total && a.r.total.how !== 'labelled total' ? '<small class="muted">No “合計/Total” line was found; this is the largest amount, so check it.</small>' : ''}</div>
+      ${a.r.total && (a.r.total.how === 'largest amount' || a.r.total.conf < 0.5) ? '<small class="muted">No “合計/Total” line was found; this is the largest amount, so check it.</small>' : ''}</div>
     <div class="field"><span>Items ${a.items.length ? `<small class="muted">(${a.items.length})</small>` : ''}</span>
-      <div id="sc-items">${a.items.map((it, i) => `<div class="item" data-i="${i}"><input class="in-n" value="${esc(it.n)}" placeholder="(unclear, type the name)" aria-label="Item name"><input class="in-a" inputmode="decimal" value="${esc(it.amt)}" aria-label="Item amount">${it.conf != null ? badge(it.conf) : ''}<button type="button" class="iconbtn" data-act="sc-del" data-i="${i}" aria-label="Remove item">${ic('x')}</button>
+      <div id="sc-items">${a.items.map((it, i) => `<div class="item" data-i="${i}"><input class="in-n" value="${esc(it.n)}" placeholder="(unclear, type the name)" aria-label="Item name"><input class="in-a" inputmode="decimal" value="${esc(it.amt)}" aria-label="Item amount">${it.conf != null ? badge(it.conf) : ''}<button type="button" class="iconbtn" data-act="sc-del" data-i="${i}" aria-label="Remove item">${ic('x')}</button><small class="gloss" ${glossLine(it.n) ? '' : 'hidden'} title="English meaning of the name, to help you check it">${esc(glossLine(it.n))}</small>
         <div class="isub">${it.note ? `<small class="muted">${esc(it.note)}</small>` : ''}<select class="in-c" aria-label="Item category"><option value="">Same as receipt${a.cat ? ' (' + esc((cats.find((c) => c.id === a.cat) || {}).name || '') + ')' : ''}</option>${cats.map((c) => `<option value="${c.id}" ${c.id === it.cat ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select>${it.cat && it.catConf ? `<small class="muted" title="${esc(it.why || '')}">${Math.round(it.catConf * 100)}%</small>` : ''}</div></div>`).join('') || '<p class="muted">No item lines were read. You can still save the total.</p>'}</div>
       <button type="button" class="linkbtn" data-act="sc-add">+ Add an item</button>
       ${a.settled && (a.settled.discount || a.settled.tax) ? `<p class="muted sumline">Items ${yen(Math.round(a.settled.gross))}${a.settled.discount ? ` − discounts ${yen(Math.round(a.settled.discount))}` : ''}${a.settled.tax ? ` + tax ${yen(Math.round(a.settled.tax))}` : ''} = ${yen(Math.round(a.settled.paid))} paid. Each price below is the final price after discount and tax.</p>` : ''}
@@ -106,6 +108,10 @@ function render(api) {
     ${a.raw ? `<label class="btn ghost wide moreb"><input type="file" id="rc-more" accept="image/*" capture="environment" hidden>Long receipt? Add the next part (photo)</label><p class="hint" id="rc-more-status" aria-live="polite"></p>` : ''}
     <div class="btnrow"><button type="button" class="btn ghost" data-act="sc-again">Scan another</button><button type="button" class="btn" data-act="sc-use">Continue to entry</button></div></form>`;
   const f = api.el;
+  // category lists: the shared pick list with search, and a way to add a category that is not there
+  const scc = f.querySelector('#sc-cat');
+  if (scc) enhanceSelect(scc, { title: 'Category', addLabel: 'Add a new category', onAdd: () => openCategoryForm({ kind: 'expense', onDone: (c) => { cur && cur.sync && cur.sync(); a.cat = c.id; render(api); } }) });
+  f.querySelectorAll('select.in-c').forEach((sel) => enhanceSelect(sel, { title: 'Category', addLabel: 'Add a new category', onAdd: () => openCategoryForm({ kind: 'expense', onDone: (c) => { sel.add(new Option(c.name, c.id)); sel.value = c.id; sel.dispatchEvent(new Event('change', { bubbles: true })); } }) }));
   const sync = () => { a.name = f.querySelector('#sc-name').value; a.date = f.querySelector('#sc-date').value; a.time = f.querySelector('#sc-time').value; a.total = f.querySelector('#sc-total').value; a.cat = f.querySelector('#sc-cat').value;
     f.querySelectorAll('#sc-items .item').forEach((row, i) => { if (a.items[i]) { a.items[i].n = row.querySelector('.in-n').value; a.items[i].amt = row.querySelector('.in-a').value; const sc = row.querySelector('.in-c'); if (sc) a.items[i].cat = sc.value; } }); };
   api.sync = sync;
@@ -115,6 +121,7 @@ function render(api) {
     try { const r = await addPart({ first: a.raw.first, second: a.raw.second }, file, (t) => { if (st) st.textContent = t; }); const prevUrl = a.previewUrl; S = analyse(r.parsed); S.previewUrl = prevUrl; S.raw = { first: r.first, second: r.second }; render(api); }
     catch (err) { if (st) st.textContent = 'Could not read that photo (' + (err && err.message ? err.message : 'error') + ').'; }
   };
+  f.querySelector('#scanform').addEventListener('input', (e) => { if (!e.target.classList || !e.target.classList.contains('in-n')) return; const g = e.target.closest('.item').querySelector('.gloss'), t = glossLine(e.target.value); if (g) { g.textContent = t; g.hidden = !t; } });   // the translation follows what you type
   f.querySelector('#scanform').addEventListener('change', (e) => { sync(); if (e.target.id === 'sc-total' || e.target.classList.contains('in-a') || e.target.id === 'sc-cat') render(api); });
 }
 
@@ -199,7 +206,7 @@ export async function readReceiptFile(file, status = () => {}, { forceSecond = f
   // first look: soft grey with the lighting evened out (shadows, glare, a wood-grain table) read best in tests; second look: hard black and white
   const grey = await prepareReceipt(file, { binarise: false, flat: true, rot }), canvas = await prepareReceipt(file, { rot });
   const known = knownNames(get()), a = await readCanvas(w, grey, status, 'Reading', 0.02, 0.55), la = a.lines, p1 = parseReceipt(la, { known });
-  const good = !forceSecond && p1.total && p1.total.conf >= 0.85 && p1.date && p1.check && p1.check.ok && p1.items.length && !p1.items[0].whole;   // everything agrees: skip the slower second look
+  const good = !forceSecond && p1.total && p1.total.conf >= 0.85 && p1.date && p1.check && p1.check.ok && p1.items.length && !p1.items[0].whole && !weakNames(p1.items, la);   // everything agrees: skip the slower second look
   let lb = null;
   if (!good) { const b = await readCanvas(w, canvas, status, 'Second look', 0.55, 0.95).catch(() => null); lb = b ? b.lines : null; }
   const parsed = parseBoth(la, lb, { known });

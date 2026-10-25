@@ -54,6 +54,7 @@ export function allCurrencies() {
   return allCache;
 }
 export function curName(c) {
+  const tk = state && state.settings && state.settings.tickers && state.settings.tickers[c]; if (tk && tk.name) return tk.name;
   const crypto = { USDT: 'Tether', USDC: 'USD Coin', DAI: 'Dai', BTC: 'Bitcoin', ETH: 'Ethereum', BNB: 'BNB', SOL: 'Solana', XRP: 'XRP', DOGE: 'Dogecoin', TON: 'Toncoin', TRX: 'TRON', ADA: 'Cardano', LTC: 'Litecoin', MATIC: 'Polygon', FDUSD: 'First Digital USD' };
   if (crypto[c]) return crypto[c];
   try { return new Intl.DisplayNames(['en'], { type: 'currency' }).of(c) || c; } catch { return c; }
@@ -181,6 +182,7 @@ async function writeRaw(obj) {
 export async function load() {
   const raw = await readRaw();
   state = raw && raw.v ? raw : emptyDb();
+  try { fixRouteNames(state); } catch { /* old data without accounts */ }
   state.settings = { ...emptyDb().settings, ...state.settings };
   applyCurDec(state.settings);
   syncHome();
@@ -189,8 +191,46 @@ export async function load() {
 export const get = () => state;
 export function subscribe(fn) { subs.add(fn); return () => subs.delete(fn); }
 
+// ---- platform > wallet > asset scope (used by the Budget and Analytics filters) ----
+// keys: '' = everything, 'p:Binance' = a platform, 'w:Binance|Earn' = one wallet, 'a:<id>' (or a bare id) = one asset/account
+export function scopeIds(db, key) {
+  if (!key) return null;
+  const live = db.accounts.filter((a) => !a.deleted), [k, v] = key.includes(':') ? [key[0], key.slice(2)] : ['a', key];
+  if (k === 'p') return new Set(live.filter((a) => (a.exchange || '') === v).map((a) => a.id));
+  if (k === 'w') { const [ex, w] = v.split('|'); return new Set(live.filter((a) => (a.exchange || '') === ex && walletOf(a) === w).map((a) => a.id)); }
+  return new Set([v]);
+}
+// the choices as <optgroup>s: each platform with its wallets and assets, then the other accounts
+export function scopeOptionsHtml(db, cur, esc) {
+  const live = db.accounts.filter((a) => !a.deleted && !a.archived), on = (k) => (cur === k || cur === k.replace(/^a:/, '') ? 'selected' : '');
+  const byEx = new Map(); for (const a of live) if (a.exchange) { if (!byEx.has(a.exchange)) byEx.set(a.exchange, []); byEx.get(a.exchange).push(a); }
+  const nb = '\u00a0\u00a0';
+  let h = `<option value="">All accounts</option>`;
+  for (const [ex, list] of [...byEx.entries()].sort((x, y) => x[0].localeCompare(y[0]))) {
+    const ws = [...new Set(list.map(walletOf))];
+    h += `<optgroup label="${esc(ex)}"><option value="p:${esc(ex)}" ${on('p:' + ex)}>All of ${esc(ex)}</option>` + ws.map((w) => `<option value="w:${esc(ex)}|${esc(w)}" ${on('w:' + ex + '|' + w)}>${nb}${esc(w)} wallet (all assets)</option>` + list.filter((a) => walletOf(a) === w).map((a) => `<option value="a:${a.id}" ${on('a:' + a.id)}>${nb}${nb}${esc(a.cur)} · ${esc(a.name)}</option>`).join('')).join('') + '</optgroup>';
+  }
+  const rest = live.filter((a) => !a.exchange).sort((x, y) => x.name.localeCompare(y.name));
+  if (rest.length) h += `<optgroup label="Other accounts">${rest.map((a) => `<option value="a:${a.id}" ${on('a:' + a.id)}>${esc(a.name)}</option>`).join('')}</optgroup>`;
+  return h;
+}
+// a transfer labelled "A to B" or "A → B" keeps following the account names: rename "SMBC" and its entries say the new name
+export function fixRouteNames(d) {
+  if (!d || !d.accounts || !d.txs) return;
+  const nm = new Map(d.accounts.filter((a) => !a.deleted).map((a) => [a.id, a.name.trim()])), live = new Set([...nm.values()].map((x) => x.toLowerCase()));
+  for (const t of d.txs) {
+    if (t.deleted || t.kind !== 'transfer' || t.trade || !t.name) continue;
+    const m = /^(.+?)\s*(→|->|\sto\s)\s*(.+)$/i.exec(t.name.trim()); if (!m) continue;
+    const fn = nm.get(t.acct), tn = nm.get(t.toAcct); if (!fn || !tn) continue;
+    const l = m[1].trim().toLowerCase(), r = m[3].trim().toLowerCase(), lOk = l === fn.toLowerCase(), rOk = r === tn.toLowerCase();
+    if (lOk && rOk) continue;
+    const lStale = !live.has(l), rStale = !live.has(r);
+    if (t.autoRoute ? (lStale || rStale || !lOk || !rOk) : ((lOk && rStale) || (rOk && lStale))) {
+      const sep = m[2].trim() === 'to' ? ' to ' : ` ${m[2].trim()} `; t.name = `${fn}${sep}${tn}`; t.autoRoute = true; stamp(t); }
+  }
+}
 export function commit(mutator) {
-  mutator(state);
+  mutator(state); fixRouteNames(state);
   syncHome();
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => writeRaw(state), 150);
@@ -198,7 +238,7 @@ export function commit(mutator) {
 }
 // saves without redrawing: for text boxes, where a redraw would steal focus from the next box
 export function commitQuiet(mutator) {
-  mutator(state);
+  mutator(state); fixRouteNames(state);
   syncHome();
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => writeRaw(state), 150);
@@ -217,6 +257,17 @@ export function replaceAll(next) {
 
 export const stamp = (rec) => { rec.updatedAt = Date.now(); return rec; };
 export const live = (arr) => arr.filter((x) => !x.deleted);
+// Investments are Platform (Binance, Bybit, KuCoin…) > wallet inside it (Spot, Funding, Futures, Margin, Earn) > asset (BTC, USDT, SOL).
+// One account is one asset in one wallet of one platform. accLabel always says where it is, whatever the account was named.
+export const WALLETS = ['Spot', 'Funding', 'Futures', 'Margin', 'Earn', 'Other'];
+export const walletOf = (a) => (a && a.exchange ? a.wallet || 'Spot' : '');
+export function accLabel(a) {
+  if (!a) return '';
+  let n = a.name || '';
+  if (a.exchange && !n.toLowerCase().includes(String(a.exchange).toLowerCase())) n = `${a.exchange} · ${n}`;
+  if (a.exchange && a.wallet && a.wallet !== 'Spot' && !n.toLowerCase().includes(a.wallet.toLowerCase())) n += ` (${a.wallet})`;
+  return n;
+}
 export const accountMap = (db) => new Map(db.accounts.map((a) => [a.id, a]));
 export const catMap = (db) => new Map(db.categories.map((c) => [c.id, c]));
 
@@ -232,9 +283,20 @@ export function deltaFor(t, id) {
   if (t.toAcct === id) d += (t.toAmount != null ? t.toAmount : t.amount) - (t.feeBy === 'to' ? feeOf(t) : 0);
   return d;
 }
+// the day an account's opening balance counts from: set by the user, or read from the Starting Balance row of an imported file
+export const openDateOf = (a) => a.openDate || (a.openRow && a.openRow.date ? a.openRow.date.slice(0, 10) : '');
+// the date an opening balance really counts from: if the account already has an entry before its stated opening date (a conflict), it moves back to the first entry's day
+export function openDates(db) {
+  const first = new Map();
+  for (const t of db.txs) { if (t.deleted) continue; const d = (t.date || '').slice(0, 10); if (!d) continue; if (t.acct && (!first.has(t.acct) || d < first.get(t.acct))) first.set(t.acct, d); if (t.kind === 'transfer' && t.toAcct && (!first.has(t.toAcct) || d < first.get(t.toAcct))) first.set(t.toAcct, d); }
+  const out = new Map();
+  for (const a of db.accounts) { const od = openDateOf(a), f = first.get(a.id); out.set(a.id, od && f && f < od ? f : od); }
+  return out;
+}
 export function balances(db, asOf) {
   const b = new Map();
-  for (const a of db.accounts) if (!a.deleted) b.set(a.id, a.open || 0);
+  const ods = openDates(db);
+  for (const a of db.accounts) if (!a.deleted) { const od = ods.get(a.id) || ''; b.set(a.id, !asOf || !od || od + ' 00:00:00' <= asOf ? a.open || 0 : 0); }
   const add = (id, v) => { if (b.has(id)) b.set(id, b.get(id) + v); };
   for (const t of db.txs) {
     if (t.deleted || (asOf && t.date > asOf)) continue;
@@ -254,13 +316,16 @@ export function sortedTxs(db) {
 export function rateFor(db, cur) {
   if (cur === BASE) return 1;
   if (db.settings.rates && db.settings.rates[cur] > 0) return db.settings.rates[cur];
+  const tk = db.settings.tickers && db.settings.tickers[cur];            // a stock or token you added yourself, priced by hand or by its last trade
+  if (tk && tk.price > 0 && tk.quote && tk.quote !== cur && !(tk.cgId && liveRate(db, cur) > 0)) { const q = rateFor(db, tk.quote); if (q > 0) return tk.price * q; }
   const lv = liveRate(db, cur);
   if (lv > 0) return lv;
   return lastTxRate(db, cur);
 }
 export function liveRate(db, cur) {
   // a code you gave your own decimals (MNT as Mantle, BBSOL) is a token, not the bank currency of the same name
-  if (db.settings.curDec && db.settings.curDec[cur] && !CRYPTO.includes(cur)) return 0;
+  const tk0 = db.settings.tickers && db.settings.tickers[cur];
+  if (db.settings.curDec && db.settings.curDec[cur] && !CRYPTO.includes(cur) && !(tk0 && tk0.cgId)) return 0;
   const l = db.settings.live;
   if (!l || !l.usd) return 0;
   const a = l.usd[BASE], b = l.usd[cur];
@@ -307,12 +372,16 @@ export const daysInMonth = (ym) => { const [y, m] = ym.split('-').map(Number); r
 export function monthParts(db, ym) { return partsOf(db, (t) => t.date.startsWith(ym)); }
 // the same, for any date range (YYYY-MM-DD, inclusive)
 export function partsBetween(db, from, to) { return partsOf(db, (t) => { const d = t.date.slice(0, 10); return d >= from && d <= to; }); }
+// while a scope is set (Budget filter), every report only counts entries from those accounts
+let SCOPE = null;
+export function withScope(ids, fn) { const prev = SCOPE; SCOPE = ids; try { return fn(); } finally { SCOPE = prev; } }
 export function partsOf(db, inRange) {
   const ex = new Set(db.settings.excludeGroups || []);
   const cats = catMap(db), out = [];
   const amap = accountMap(db);
   for (const t of db.txs) {
     if (t.deleted || t.reval || !inRange(t)) continue;
+    if (SCOPE && !SCOPE.has(t.kind === 'transfer' && t.feeBy === 'to' ? t.toAcct : t.acct)) continue;
     if (t.kind === 'transfer') {          // only its fee counts as spending
       if (feeOf(t) && t.feeCat) {
         const c = cats.get(t.feeCat), g = c ? c.group : 'Uncategorized';

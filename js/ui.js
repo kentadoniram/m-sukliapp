@@ -85,10 +85,10 @@ window.addEventListener('popstate', () => {
   const top = [...stack].reverse().find((x) => !x.pend);
   if (top) top.dispose(true);
 });
-export function sheet(html, { title = '', onClose, wide = false } = {}) {
+export function sheet(html, { title = '', onClose, wide = false, cls = '' } = {}) {
   const wrap = document.createElement('div');
   wrap.className = 'scrim';
-  wrap.innerHTML = `<div class="sheet ${wide ? 'wide' : ''}" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+  wrap.innerHTML = `<div class="sheet ${wide ? 'wide' : ''} ${cls}" role="dialog" aria-modal="true" aria-label="${esc(title)}">
     <div class="sheet-head"><h2>${esc(title)}</h2><button type="button" class="iconbtn" data-close aria-label="Close">${ic('x')}</button></div>
     <div class="sheet-body">${html}</div></div>`;
   document.body.appendChild(wrap);
@@ -151,6 +151,8 @@ export function promptDialog(label, value = '', { type = 'text', okLabel = 'Save
   });
 }
 
+// 2026-10-25-1213: the date and the time (HHMM) so two exports on one day never share a name
+export const fileStamp = (d = new Date()) => { const p = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`; };
 export function download(name, text, type = 'text/csv') {
   const url = URL.createObjectURL(new Blob([text], { type: type + ';charset=utf-8' }));
   const a = document.createElement('a');
@@ -228,15 +230,25 @@ window.__hd = () => [hdepth, stack.length, ignorePop];
   btn.type = 'button'; btn.className = 'clearx'; btn.setAttribute('aria-label', 'Clear'); btn.hidden = true; btn.textContent = '×';
   let cur = null;
   const ok = (el) => el && el.tagName === 'INPUT' && /^(text|search|email|tel|url|number)$/.test(el.type) && !el.readOnly && !el.dataset.noclear && !el.closest('.amtwrap, .keypad');
+  // The button lives inside the field's own parent and is placed with the field's offsets, so it moves with the field by itself (a fixed button went astray on the iPhone home-screen app when the keyboard panned the page).
+  let last = '', raf = 0, host = null, hostAdded = false;
+  const release = () => { btn.hidden = true; if (btn.parentNode) btn.remove(); if (host && hostAdded) host.classList.remove('clearhost'); host = null; hostAdded = false; last = ''; };
+  const attach = (el) => { const h = el.parentElement; if (!h) return false; if (h !== host) { release(); host = h; if (getComputedStyle(h).position === 'static') { h.classList.add('clearhost'); hostAdded = true; } } if (btn.parentNode !== h) h.appendChild(btn); return true; };
   const place = () => {
-    if (!cur || !document.body.contains(cur) || !cur.value) { btn.hidden = true; return; }
-    const r = cur.getBoundingClientRect();
-    btn.style.left = (r.right - 30) + 'px'; btn.style.top = (r.top + r.height / 2 - 13) + 'px'; btn.hidden = false;
+    if (!cur || !document.body.contains(cur) || !cur.value) { btn.hidden = true; last = ''; return; }
+    if (!attach(cur)) { btn.hidden = true; return; }
+    if (cur.offsetParent !== host && cur.offsetParent !== btn.offsetParent) { btn.hidden = true; return; }
+    const l = cur.offsetLeft + cur.offsetWidth - 30, t = cur.offsetTop + cur.offsetHeight / 2 - 13, key = [l, t, cur.offsetHeight].join();
+    if (key === last && !btn.hidden) return; last = key;
+    btn.style.left = l + 'px'; btn.style.top = t + 'px'; btn.hidden = false;
   };
-  document.addEventListener('focusin', (e) => { if (ok(e.target)) { cur = e.target; if (!btn.parentNode) document.body.appendChild(btn); place(); setTimeout(place, 420); } else { cur = null; btn.hidden = true; } });
+  const loop = () => { raf = 0; if (!cur) return; place(); raf = requestAnimationFrame(loop); };
+  const track = () => { if (!raf) raf = requestAnimationFrame(loop); };
+  document.addEventListener('focusin', (e) => { const x = e.target; if (x && x.tagName === 'INPUT' && /^(decimal|numeric)$/.test(x.getAttribute('inputmode') || '') && x.value && !x.readOnly) setTimeout(() => { try { x.select(); x.setSelectionRange(0, 99999); } catch { /* not selectable */ } }, 30); });
+  document.addEventListener('focusin', (e) => { if (ok(e.target)) { cur = e.target; last = ''; place(); track(); } else { cur = null; release(); } });
   document.addEventListener('input', (e) => { if (e.target === cur) place(); });
-  document.addEventListener('focusout', () => setTimeout(() => { if (document.activeElement !== btn && !ok(document.activeElement)) { cur = null; btn.hidden = true; } }, 150));
-  window.addEventListener('scroll', place, true); window.addEventListener('resize', place);
+  document.addEventListener('focusout', () => setTimeout(() => { if (document.activeElement !== btn && !ok(document.activeElement)) { cur = null; release(); } }, 150));
+  window.addEventListener('resize', place);
   btn.addEventListener('pointerdown', (e) => e.preventDefault());
-  btn.addEventListener('click', () => { if (!cur) return; cur.value = ''; cur.dispatchEvent(new Event('input', { bubbles: true })); cur.focus(); place(); });
+  btn.addEventListener('click', () => { if (!cur) return; cur.value = ''; cur.dispatchEvent(new Event('input', { bubbles: true })); cur.focus(); last = ''; place(); });
 })();

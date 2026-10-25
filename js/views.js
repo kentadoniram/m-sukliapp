@@ -1,14 +1,15 @@
 // The extra windows: menu drawer, Calendar, Budget (donut), Cash flow, Categories, and the detail sheets.
-import { softDelete } from './core.js';
+import { softDelete, scopeIds, scopeOptionsHtml, withScope } from './core.js';
 import {
   get, commit, stamp, fmt, compact, BASE, HOME, monthParts, dayTotals, daysInMonth, shiftMonth, thisMonth, monthLabel, dayLabel, nowStamp,
   reviewCount, catMap, accountMap, groupColor, groupLetter, sortedTxs,
 } from './core.js';
 import { pace, totals, trend, baselineMonths } from './insights.js';
-import { ui, hdr, monthNav, strip, money, row, gbar, coll, trendChart, budgetOf } from './screens.js';
+import { ui, hdr, monthNav, strip, money, row, gbar, coll, trendChart, budgetOf, pieLabels } from './screens.js';
 import { openEntry, openCategoryForm } from './entry.js';
 import { forecastNext, behaviorNotes, detectRecurring } from './finance.js';
 import { reminderBanner } from './accpage.js';
+import { alertPct, budgetAlerts, budgetStatus, classCard } from './budgetsetup.js';
 import { ACT, sheet, ic, esc, confirmDialog, promptDialog, pushOverlay, toast } from './ui.js';
 
 const sum = (a) => a.reduce((x, y) => x + y, 0);
@@ -20,6 +21,7 @@ const monthStat = (db, ym) => { const i = totals(db, ym, 'income').total, o = to
 // Menu drawer (burger)
 // =====================================================================
 let drawerOpen = null;
+const catOpen = () => { try { return localStorage.getItem('sukli-menu-cats') === '1'; } catch { return false; } };
 ACT.menu = () => {
   if (drawerOpen) { drawerOpen(); return; }
   const n = reviewCount(get());
@@ -28,9 +30,9 @@ ACT.menu = () => {
   const wrap = document.createElement('div');
   wrap.className = 'drawer-scrim';
   wrap.innerHTML = `<nav class="drawer" aria-label="Menu"><div class="drawer-head"><b>Sukli</b><button type="button" class="iconbtn" data-x aria-label="Close menu">${ic('x')}</button></div>
-    <ul>${item('home', 'Home', 'home')}${item('ledger', 'Entries', 'list')}${item('calendar', 'Calendar', 'calendar')}${item('budget', 'Budget', 'pie')}${item('cashflow', 'Cash flow', 'flow')}${item('outlook', 'Outlook', 'spark')}${item('analytics', 'Analytics', 'chart')}${item('accounts', 'Accounts', 'wallet')}${item('review', 'Review', 'check', n)}</ul>
-    <h3>Categories</h3>
-    <ul>${item('categories?k=expense', 'Expense categories', 'tag')}${item('categories?k=income', 'Income categories', 'tag')}</ul>
+    <ul>${item('home', 'Home', 'home')}${item('ledger', 'Entries', 'list')}${item('calendar', 'Calendar', 'calendar')}${item('budget', 'Budget', 'pie')}${item('invest', 'Investments', 'spark')}${item('cashflow', 'Cash flow', 'flow')}${item('outlook', 'Outlook', 'spark')}${item('analytics', 'Analytics', 'chart')}${item('accounts', 'Accounts', 'wallet')}${item('review', 'Review', 'check', n)}</ul>
+    <button type="button" class="dhead" data-dtoggle aria-expanded="${catOpen()}"><span>Categories</span>${ic('down', 'chev')}</button>
+    <ul class="dsub" ${catOpen() ? '' : 'hidden'}>${item('categories?k=expense', 'Expense categories', 'tag')}${item('categories?k=income', 'Income categories', 'tag')}</ul>
     <ul>${'<li><a href="#" data-act="scan">'}${ic('camera')}<span>Scan a receipt</span></a></li><li><a href="#" data-act="loan-plan">${ic('calc')}<span>Loan planner</span></a></li></ul>
     <ul class="last">${item('bin', 'Recycle bin', 'trash')}${item('settings', 'Settings', 'gear')}</ul></nav>`;
   document.body.appendChild(wrap);
@@ -40,7 +42,10 @@ ACT.menu = () => {
   const close = () => ov.close();
   drawerOpen = close;
   document.addEventListener('keydown', onKey);
-  wrap.addEventListener('click', (e) => { if (e.target === wrap || e.target.closest('[data-x]') || e.target.closest('a, [data-act]')) close(); });
+  wrap.addEventListener('click', (e) => {
+    const tg = e.target.closest('[data-dtoggle]');
+    if (tg) { const ul = tg.nextElementSibling, open = ul.hidden; ul.hidden = !open; tg.setAttribute('aria-expanded', open); try { localStorage.setItem('sukli-menu-cats', open ? '1' : '0'); } catch { /* blocked */ } return; }
+    if (e.target === wrap || e.target.closest('[data-x]') || e.target.closest('a, [data-act]')) close(); });
   const first = wrap.querySelector('a'); if (first && matchMedia('(pointer:fine)').matches) first.focus();
 };
 
@@ -198,29 +203,49 @@ function openDay(date) {
 // =====================================================================
 // Budget: interactive donut, percentages, expandable rows, warnings
 // =====================================================================
-ACT.slice = (el) => { ui.pie = ui.pie === el.dataset.k ? '' : el.dataset.k; render(); };
+// tapping a slice or a warning only changes the highlight, the centre text and the open row: nothing is redrawn, so nothing can flicker
+ACT.slice = (el) => {
+  ui.pie = ui.pie === el.dataset.k ? '' : el.dataset.k;
+  const svg = document.querySelector('svg.donut:not(.sm)');
+  if (!svg) { render(); return; }
+  const sl = [...svg.querySelectorAll('.slice[data-k]')], sel = sl.find((c) => c.dataset.k === ui.pie);
+  sl.forEach((c) => { c.classList.toggle('sel', c === sel); c.classList.toggle('dim', !!sel && c !== sel); c.setAttribute('stroke-width', c === sel ? 34 : 28); });
+  const tx = svg.querySelectorAll('text.dl, text.dv');
+  if (tx.length === 3) { tx[0].textContent = sel ? sel.dataset.label : svg.dataset.l0; tx[1].textContent = sel ? sel.dataset.val : svg.dataset.v0; tx[2].textContent = sel ? sel.dataset.pct + '% of outflow' : svg.dataset.m0; }
+  document.querySelectorAll('details.pierow').forEach((d) => { d.open = !!sel && d.dataset.k === ui.pie; });
+  if (sel) { const d = document.querySelector(`details.pierow[data-k="${CSS.escape(ui.pie)}"]`); if (d) { const r = d.getBoundingClientRect(); if (r.top < 60 || r.bottom > innerHeight) d.scrollIntoView({ block: 'nearest' }); } }
+};
+document.addEventListener('change', (e) => { const el = e.target.closest && e.target.closest('select[data-bscope]'); if (el) { ui.bscope = el.value; render(); } });
 ACT.pieby = (el) => { ui.pieBy = el.dataset.v; ui.pie = ''; render(); };
 
+// Budget can be limited to one platform, wallet or account (platform › wallet › asset)
 export function budget(db) {
+  const ids = scopeIds(db, ui.bscope || '');
+  return withScope(ids, () => budgetInner(db)).replace('<!--scope-->', `<label class="field bscope"><span>Spending from</span><select data-bscope aria-label="Platform, wallet or account">${scopeOptionsHtml(db, ui.bscope || '', esc)}</select></label>`);
+}
+function budgetInner(db) {
   const ym = ui.month, cats = catMap(db);
   const by = ui.pieBy || 'group';
   const out = totals(db, ym), total = out.total;
   const p = pace(db, ym);
-  const budgets = db.budgets.filter((b) => !b.deleted && b.amount > 0);
-  const budgeted = sum(budgets.map((b) => b.amount));
-  const spentIn = sum(budgets.map((b) => out.by.get(b.group) || 0));
+  const budgets = db.budgets.filter((b) => !b.deleted && b.amount > 0 && b.group);   // group budgets; category budgets are checked by Budget setup
+  const lim = alertPct(db) / 100;
+  const catB = budgetStatus(db, ym).filter((x) => x.kind === 'cat' && !budgets.some((b) => b.group === x.group));   // category budgets count too, unless their whole group has a budget
+  const budgeted = sum(budgets.map((b) => b.amount)) + sum(catB.map((x) => x.budget));
+  const spentIn = sum(budgets.map((b) => out.by.get(b.group) || 0)) + sum(catB.map((x) => x.spent));
   const left = budgeted - spentIn;
   // warnings
   const warns = [];
   for (const b of budgets) {
     const v = out.by.get(b.group) || 0, r = v / b.amount;
     if (r >= 1) warns.push({ tone: 'over', g: b.group, text: `${b.group}: over budget by ${R(v - b.amount)} (${Math.round(r * 100)}% used).` });
-    else if (r >= 0.8) warns.push({ tone: 'warn', g: b.group, text: `${b.group}: ${Math.round(r * 100)}% of the budget used, ${R(b.amount - v)} left.` });
+    else if (r >= lim) warns.push({ tone: 'warn', g: b.group, text: `${b.group}: ${Math.round(r * 100)}% of the budget used, ${R(b.amount - v)} left.` });
     else if (p.live && p.day >= 5 && v / p.day * p.dim > b.amount) {
       const hit = Math.ceil(b.amount / (v / p.day));
       warns.push({ tone: 'warn', g: b.group, text: `${b.group}: at this pace the budget runs out around day ${hit}.` });
     }
   }
+  for (const a of budgetAlerts(db, ym).filter((x) => x.kind === 'cat')) warns.push({ tone: a.tone === 'info' ? 'warn' : a.tone, g: a.group, text: a.text });
   // slices
   let slices;
   if (by === 'category') {
@@ -238,11 +263,12 @@ export function budget(db) {
   let acc = 0;
   const arcs = slices.map((x) => {
     const len = total ? x.v / total * C : 0, d = Math.max(0, len - 1.6);
-    const el = `<circle data-tip="${esc(`${x.label}: ${money(x.v)} (${total ? Math.round(x.v / total * 100) : 0}%)`)}" class="slice ${sel ? (sel === x ? 'sel' : 'dim') : ''}" cx="90" cy="90" r="64" fill="none" stroke="${groupColor(x.color)}" stroke-width="${sel === x ? 34 : 28}" stroke-dasharray="${d} ${C - d}" stroke-dashoffset="${-acc}" transform="rotate(-90 90 90)" data-act="slice" data-k="${esc(x.key)}" role="button" tabindex="0" aria-label="${esc(x.label)} ${total ? Math.round(x.v / total * 100) : 0}%"><title>${esc(x.label)}: ${money(x.v)}</title></circle>`;
+    const el = `<circle data-tip="${esc(`${x.label}: ${money(x.v)} (${total ? Math.round(x.v / total * 100) : 0}%)`)}" class="slice ${sel ? (sel === x ? 'sel' : 'dim') : ''}" cx="90" cy="90" r="64" fill="none" stroke="${groupColor(x.color)}" stroke-width="${sel === x ? 34 : 28}" stroke-dasharray="${d} ${C - d}" stroke-dashoffset="${-acc}" transform="rotate(-90 90 90)" data-act="slice" data-k="${esc(x.key)}" data-label="${esc(x.label)}" data-val="${esc(money(x.v))}" data-pct="${total ? Math.round(x.v / total * 100) : 0}" role="button" tabindex="0" aria-label="${esc(x.label)} ${total ? Math.round(x.v / total * 100) : 0}%"><title>${esc(x.label)}: ${money(x.v)}</title></circle>`;
     acc += len; return el;
   }).join('');
+  const pcts = total ? pieLabels(slices.map((x) => x.v / total), { cx: 90, cy: 90, r: 64, hw: 17 }) : '';
   const donut = total
-    ? `<svg class="donut" viewBox="0 0 180 180" role="img" aria-label="Spending split">${arcs}
+    ? `<svg class="donut" viewBox="-30 -10 240 200" role="img" aria-label="Spending split" data-l0="Cash outflow" data-v0="${esc(money(total))}" data-m0="${esc(monthLabel(ym).split(' ')[0])}">${arcs}${pcts}
         <text x="90" y="84" text-anchor="middle" class="dl">${esc(sel ? sel.label : 'Cash outflow')}</text>
         <text x="90" y="104" text-anchor="middle" class="dv">${sel ? money(sel.v) : money(total)}</text>
         <text x="90" y="121" text-anchor="middle" class="dl">${sel ? Math.round(sel.v / total * 100) + '% of outflow' : monthLabel(ym).split(' ')[0]}</text></svg>`
@@ -264,16 +290,17 @@ export function budget(db) {
     } else {
       inner = `<p class="hint">${pct}% of everything spent this month.</p>`;
     }
-    return `<details class="pierow" ${open}><summary><i class="dot2" style="background:${groupColor(x.color)}"></i><span class="pl">${esc(x.label)}</span>${chip}<span class="pp">${pct}%</span><b>${money(x.v)}</b>${ic('down', 'chev')}</summary><div class="pbody">${inner}</div></details>`;
+    return `<details class="pierow" data-k="${esc(x.key)}" ${open}><summary><i class="dot2" style="background:${groupColor(x.color)}"></i><span class="pl">${esc(x.label)}</span>${chip}<span class="pp">${pct}%</span><b>${money(x.v)}</b>${ic('down', 'chev')}</summary><div class="pbody">${inner}</div></details>`;
   };
-  const sumBlock = budgets.length
+  const sumBlock = (budgets.length || catB.length)
     ? `<div class="facts three"><div><span>Budgeted</span><b>${R(budgeted)}</b></div><div><span>Spent in them</span><b>${R(spentIn)}</b></div><div><span>${left >= 0 ? 'Left' : 'Over by'}</span><b class="${left < 0 ? 'neg' : 'in'}">${R(Math.abs(left))}</b></div></div>
        <div class="track tall"><div class="fill ${spentIn > budgeted ? 'over' : spentIn / budgeted >= 0.8 ? 'warn' : ''}" style="width:${Math.min(100, spentIn / budgeted * 100)}%"></div></div>
        <p class="hint">${Math.round(spentIn / budgeted * 100)}% of the total budget used${p.live && p.dim - p.day > 0 && left > 0 ? `, about ${R(left / (p.dim - p.day))} a day for the ${p.dim - p.day} days left` : ''}.</p>`
     : '<p class="hint">No budgets yet. Open a group below and press “Set a monthly budget”.</p>';
-  return `${monthNav()}
+  return `${monthNav()}<!--scope-->
     ${warns.length ? `<section class="bwarn">${warns.map((w) => `<button class="warnrow ${w.tone}" data-act="slice" data-k="${esc(w.g)}">${ic('check')}<span>${esc(w.text)}</span></button>`).join('')}</section>` : ''}
-    ${coll('b-sum', 'Budget summary', sumBlock)}
+    ${coll('b-sum', 'Budget summary', sumBlock, '<button type="button" class="btn sm ghost" data-act="budget-setup">Budget setup</button>')}
+    ${coll('b-class', 'Needs, wants and luxury', classCard(db, ym) || '<p class="hint">Nothing spent in this month yet.</p>')}
     <section class="seg-wrap"><div class="seg two" role="group" aria-label="Split by">${[['group', 'By group'], ['category', 'By category']].map(([v, l]) => `<button type="button" data-act="pieby" data-v="${v}" class="${by === v ? 'on' : ''}" aria-pressed="${by === v}">${l}</button>`).join('')}</div>
       ${donut}${total ? '<p class="hint center">Tap a slice or a row for the detail.</p>' : ''}</section>
     <section>${slices.map(rowFor).join('')}</section>`;

@@ -36,7 +36,7 @@ export const SHOP_CUES = [
 // OCR swaps look-alike characters (輸→軸, 白→哲, バ→パ). A word from a list of everyday grocery words that is one look-alike character away is put right.
 const LOOK = ['輸軸輪転', '白哲百自臼', 'バパハ', 'ベペヘ', 'ビピヒ', 'ブプフ', 'ボポホ', 'ドト', 'カ力', 'トト卜', 'ロ口', 'タ夕', 'エ工', 'ニ二', '豆立', '乳孔', '鶏鳥', '卵卯'];
 const SAME = (a, b) => LOOK.some((g) => g.includes(a) && g.includes(b));
-const WORDS = ['バナナ', '白たまご', 'たまご', '輸入牛', '輸入', '国産', '牛乳', '食パン', '豆腐', '納豆', '豚バラ', '豚こま', '鶏もも', '鶏むね', 'ヨーグルト', 'チーズ', 'バター', 'キャベツ', 'にんじん', '玉ねぎ', 'じゃがいも', 'トマト', 'きゅうり', 'ほうれん草', 'もやし', 'りんご', 'みかん', 'いちご', 'ぶどう', 'レタス', 'ブロッコリー', 'しいたけ', '食卓', '毎日の', 'カット', 'ステーキ', 'ソーセージ', 'ウインナー', 'ハム', 'ベーコン', 'ジュース', '麦茶', '緑茶', '豆乳', 'ティッシュ', '洗剤', 'レジ袋', '味噌', '醤油', '砂糖', 'マヨネーズ', 'ケチャップ', 'カレー', 'ラーメン', 'うどん', 'パスタ', 'おにぎり', '弁当', 'サラダ', '刺身', 'ヨーグルト', 'アイス', 'チョコ', 'スナック', 'ビール', 'ミネラルウォーター', '食パン', 'ロースハム', 'ささみ', 'ひき肉', 'ベビー', 'ペットボトル'];
+const WORDS = ['バナナ', '白たまご', 'たまご', '輸入牛', '輸入', '国産', '牛乳', '食パン', '豆腐', '納豆', '豚バラ', '豚こま', '鶏もも', '鶏むね', 'ヨーグルト', 'チーズ', 'バター', 'キャベツ', 'にんじん', '玉ねぎ', 'じゃがいも', 'トマト', 'きゅうり', 'ほうれん草', 'もやし', 'りんご', 'みかん', 'いちご', 'ぶどう', 'レタス', 'ブロッコリー', 'しいたけ', '食卓', '毎日の', 'カット', 'ステーキ', 'ソーセージ', 'ウインナー', 'ハム', 'ベーコン', 'ジュース', '麦茶', '緑茶', '豆乳', 'ティッシュ', '洗剤', 'レジ袋', '味噌', '醤油', '砂糖', 'マヨネーズ', 'ケチャップ', 'カレー', 'ラーメン', 'うどん', 'パスタ', 'おにぎり', '弁当', 'サラダ', '刺身', 'ヨーグルト', 'アイス', 'チョコ', 'スナック', 'ビール', 'ミネラルウォーター', '食パン', 'ロースハム', 'ささみ', 'ひき肉', 'ベビー', 'ペットボトル', '午後の紅茶', 'レモンティー', 'とろける', 'カフェ', 'クラフトボス', 'イタリアーノ', 'サントリー', '目玉焼', '若鶏', '醤油', '香り揚げ', '黒毛和牛', '和牛', '等級', 'モモステーキ', '使用', '紅茶', 'コーヒー'];
 export function repairName(name) {
   let out = String(name || '');
   for (const w of WORDS) {
@@ -49,6 +49,7 @@ export function repairName(name) {
       out = out.slice(0, i) + w + out.slice(i + n);
     }
   }
+  out = out.replace(/(?<=[\p{sc=Han}\p{sc=Hiragana}\p{sc=Katakana}])[1l|]?!\s*/gu, '！').replace(/(\d)\s+(?=[等号枚切種年度玉割])/g, '$1');   // a Japanese exclamation mark; "5 等級" is "5等級"
   out = out.replace(/^[ァ-ヶA-Za-z]{1,3}(?=(?:レジ袋|バナナ)(?:[SMLＳＭＬ])?$)/, '');                    // a few stray letters (the logo or the ◇ mark) in front of a plain word
   return out.replace(/(\d)\s+(\d)(?=個)/, '$1$2').replace(/(\d)\s*[Oo0]\s*[FEf]\s*$/, '$10個');                 // "10個" read as "1 OF"
 }
@@ -153,26 +154,32 @@ function priceOf(t) {
 }
 export function findItems(lines) {
   const items = []; let tax = 0, taxIncluded = false;
-  const jp = lines.some((l) => /[\p{sc=Hiragana}\p{sc=Katakana}]/u.test(l.text));
+  const jp = lines.some((l) => /[\p{sc=Hiragana}\p{sc=Katakana}]/u.test(l.text)), starRed = lines.some((l) => /印\s*は\s*軽減|軽減税率/.test(NK(l.text)));   // "＊印は軽減税率適用": a leading * means 8%
+  let pend = null;                                                                  // a name with no price, waiting for its "3コ×単108 ¥324" line
   for (const [i, l] of lines.entries()) {
-    const t = trimTail(NK(l.text).trim()); if (!t) continue;
+    const t = trimTail(NK(l.text).trim().replace(/([¥￥])\s?([0-9IlOo|S,]{1,7})/, (_, y, d) => y + d.replace(/[Il|]/g, '1').replace(/[Oo]/g, '0').replace(/S/g, '5'))); if (!t) continue;   // "¥I0" is ¥10
     if (/外税|外\s?\d{1,3}\s?%|消費税|\btax\b|\bvat\b/i.test(t)) {
       const all = amountsIn(t.replace(/\d{1,3}\s?%/g, ' ')), a = all[all.length - 1]; if (/内|うち/.test(t)) taxIncluded = true;   // "外10% 対象 ¥5": the 10 is a rate, not an amount
       if (a && /対象/.test(t) && /外/.test(t) && all.length >= 2 && a.v < all[all.length - 2].v) { tax += a.v; continue; }   // "外税 8%対象 356 28": base and tax on one line
       if (a && /外税|外\s?\d{1,3}\s?%|\btax\b|\bvat\b/i.test(t) && !/内|うち|対象/.test(t)) tax += a.v;     // tax printed on top of the item prices
       continue;
     }
+    const qt = t.match(/^(\d{1,3})\s*[コ個点本]\s*[x×X＊*]\s*単?\s*¥?\s*(\d{1,5})\s+¥\s?(\d[\d,]*)\s*[軽※*外内]?$/);
+    if (qt && pend && i - pend.i <= 2) { const v = money('¥' + qt[3]); if (v) { items.push({ name: goodName(pend.name) ? pend.name : '', raw: pend.name, amt: v, pct: 0, reduced: pend.reduced, qty: +qt[1], unit: +qt[2], conf: clamp((0.35 + 0.65 * ((l.conf ?? 70) / 100)) * 0.9), line: i }); pend = null; continue; } }
     const q = t.match(/^[@＠]?\s?(\d{1,3})\s*[コ個点本]\s*[x×＊*@]\s*(?:単|@)?\s*¥?(\d{1,5})\s*$/) || t.match(/@\s?\d+\s*[x×]\s*(\d{1,2})\s*[点個コ本]/);
     if (q && items.length) { items[items.length - 1].qty = +q[1]; if (q[2]) items[items.length - 1].unit = +q[2]; continue; }
     if (/20\d{2}[^\d\n]{1,2}\d{1,2}[^\d\n]{1,2}\d{1,2}|\d{1,2}\s*[:：]\s*\d{2}/.test(t) || NOT_AMOUNT.test(t)) continue;   // date, time, phone, card and register lines
     if (SKIP_ITEM.test(t) && !/値引|割引|クーポン/.test(t)) continue;
-    const pr = priceOf(t); if (!pr || !pr.v) continue;
-    let name = repairName(t.slice(0, pr.at).replace(/[¥\s.:*＊]+$/, '').replace(/^[^\p{L}\p{N}-]+/u, '').replace(/^[\d\s]*(?=\D)/, '').replace(/^[*＊\s]+/, '').trim());
-    if (jp && pr.strong && pr.v >= 1 && pr.v <= 10 && !/値引|割引|クーポン|引/.test(name) && !/[\p{sc=Han}\p{sc=Hiragana}\p{sc=Katakana}]/u.test(name)) name = 'レジ袋';   // a few yen and a name that is only noise: the carrier bag
+    const pr = priceOf(t);
+    // a stray mark after a katakana word is line-end noise; a starred name with no price waits for its "3コ×単108 ¥324" line
+    if ((!pr || !pr.v) && /^[*＊・]\s*\S{2,}/.test(t) && !/\d{3,}/.test(t)) { const nm = repairName(t.replace(/^[*＊・\s]+/, '').replace(/(?<=[ァ-ヶー])[しレ|\]]$/, '').replace(/[\s|\]]+$/, '').trim()); if (nm.length >= 3) pend = { name: nm, i, reduced: starRed && /^[*＊]/.test(t) }; continue; }
+    if (!pr || !pr.v) continue;
+    let name = repairName(t.slice(0, pr.at).replace(/[¥\s.:*＊]+$/, '').replace(/^[^\p{L}\p{N}-]+/u, '').replace(/^(?:\d+\s+|\d+(?![等号枚切種年度玉割%％]))(?=\D)/, '').replace(/^[*＊\s]+/, '').trim());
+    if (jp && pr.strong && pr.v >= 1 && pr.v <= 10 && !/値引|割引|クーポン|引/.test(name) && name.replace(/[^\p{L}]/gu, '').length >= 2 && !/[\p{sc=Han}\p{sc=Hiragana}\p{sc=Katakana}]/u.test(name)) name = 'レジ袋';   // a few yen and a name that is only noise: the carrier bag
     const disc = /値引|割引|クーポン|引|discount/i.test(name) && !/ー$/.test(name);
     if (!pr.strong && !(goodName(name) && pr.v >= 10 && name.replace(/[^\p{L}]/gu, '').length >= (/[\p{sc=Han}\p{sc=Hiragana}\p{sc=Katakana}]/u.test(name) ? 1 : 3))) continue;   // an unmarked number is only a price when the name is clearly a word
     const pm = disc ? name.match(/(\d{1,2})\s?%/) : null, ok = goodName(name);
-    items.push({ name: ok ? name : '', raw: name, amt: disc && pr.v > 0 ? -pr.v : pr.v, pct: pm ? +pm[1] : 0, reduced: pr.mark === '軽', conf: clamp((0.35 + 0.65 * ((l.conf ?? 70) / 100)) * (ok ? 1 : 0.7)), line: i });
+    items.push({ name: ok ? name : '', raw: name, amt: disc && pr.v > 0 ? -pr.v : pr.v, pct: pm ? +pm[1] : 0, reduced: pr.mark === '軽' || (starRed && /^[*＊]/.test(t) && !disc), conf: clamp((0.35 + 0.65 * ((l.conf ?? 70) / 100)) * (ok ? 1 : 0.7)), line: i });
   }
   return { items, tax, taxIncluded };
 }
@@ -208,6 +215,10 @@ export function findTotal(lines, items) {
   if (seen && base > 0) cand.push({ value: base + taxSum, conf: 0.6, line: -1, how: 'taxable amount plus tax', src: 'tax' });
   const ext = findItems(lines).tax;                                          // 4. subtotal plus tax printed on top of it
   if (ext > 0) for (const l of lines) { const t = T(l); if (/小計|sub ?total/i.test(t)) { const a = amountsIn(t).pop(); if (a && a.v > 0 && a.v + ext < 5e5) cand.push({ value: a.v + ext, conf: 0.58, line: -1, how: 'subtotal plus tax', src: 'sub' }); } }
+  let sub = 0;                                                                // the subtotal / taxable amount printed above the total
+  for (const l of lines) { const t = T(l); if (/小計|対象(額|金額)?/.test(t) && !NOT_AMOUNT.test(t)) { const a = amountsIn(t).pop(); if (a && a.v > sub && a.v < 5e5) sub = a.v; } }
+  for (const l of lines) { const m = T(l).match(/外\s?(8|10)\s?[%％]?/); if (m && sub > 0) { cand.push({ value: sub + Math.floor(sub * +m[1] / 100), conf: 0.62, line: -1, how: `subtotal plus ${m[1]}% tax`, src: 'tax2' }); break; } }   // 外8% = +8%, rounded down
+  if (sub > 0) for (let k = cand.length - 1; k >= 0; k--) if (cand[k].value < sub * 0.95) cand.splice(k, 1);     // "54" cannot be the total of a 699 subtotal: a digit was lost
   if (cand.length) {
     const sum = items.reduce((s, x) => s + x.amt, 0);
     for (const c of cand) { c.agree = new Set(cand.filter((o) => Math.abs(o.value - c.value) <= 1).map((o) => o.src)).size; if (items.length && (Math.abs(c.value - sum) <= 1 || (ext && Math.abs(c.value - sum - ext) <= 1))) c.agree++; if (c.src === 'paytotal') c.agree++; }
@@ -275,6 +286,11 @@ export function parseReceipt(lines, { known = [], today = new Date(), settle: do
       check = { ok: true, sum: sum2, diff: Math.round(want - sum2), tax, repaired: true };
       total.conf = clamp(total.conf + 0.2);
     }
+  }
+  if (total && items.length && check.ok === false && !check.repaired) {           // one price unreadable ("¥I0" for ¥190): the rest of the list and the printed subtotal say what it must be
+    const bad = items.map((x, i) => (x.amt > 0 && x.amt < 30 ? i : -1)).filter((i) => i >= 0);
+    if (bad.length === 1) { const rest = items.reduce((s2, x, i) => s2 + (i === bad[0] ? 0 : x.amt), 0), need = [...subs, ...(tax ? [total.value - tax] : []), total.value].filter((v) => v > 0).map((v) => v - rest).find((v) => v >= 30 && v <= 50000);
+      if (need) { const it = items[bad[0]]; it.was = it.amt; it.amt = need; it.conf = Math.min(it.conf, 0.55); it.fromSubtotal = true; check = { ok: true, sum: rest + need, diff: Math.round(total.value - rest - need), tax, repaired: true }; total.conf = clamp(total.conf + 0.1); } }
   }
   const rawItems = items.map((x) => ({ ...x }));
   // item lines (marked with * or ・) whose price could not be read at all: if exactly one is missing, the subtotal tells its price
@@ -347,6 +363,10 @@ export function linesFromOcr(data) {
 // ---- two readings of one photo: fix each item line by arithmetic ----
 const near = (a, b) => Math.abs(a - b) <= 1;
 const fits = (sum, targets, tax) => targets.some((t) => near(sum, t) || (tax && near(sum + tax, t)));
+// how much a name looks like a real one: Japanese letters count for it, Latin noise and symbols ("ERO®IHED BS") against it
+const nameScore = (n) => { const t = String(n || '').replace(/\s/g, ''); if (!t) return -1; const ja = [...t].filter((c) => /[\p{sc=Han}\p{sc=Hiragana}\p{sc=Katakana}ー0-9]/u.test(c)).length, junk = [...t].filter((c) => /[A-Za-z®©@#%&|\\_~^]/.test(c)).length; return (ja - 1.5 * junk) / t.length; };
+// on a Japanese receipt: true when some item name still looks like noise (worth a second look at the picture)
+export const weakNames = (items, lines) => lines.some((l) => /[\p{sc=Hiragana}\p{sc=Katakana}]/u.test(l.text)) && items.some((i) => !i.whole && (!i.name || nameScore(i.name) < 0.3));
 function mergeItems(A0, B0, targets, tax) {
   const [A, B] = A0.length >= B0.length ? [A0, B0] : [B0, A0];     // the longer reading is the frame; the other is lined up against it
   const rows = A.map((a) => ({ c: [a] })), used = new Set();
@@ -368,7 +388,7 @@ function mergeItems(A0, B0, targets, tax) {
     if (hits.length) {
       hits.sort((x, y) => x.reduce((s2, it) => s2 + (it.viaPct ? 1 : 0), 0) - y.reduce((s2, it) => s2 + (it.viaPct ? 1 : 0), 0));
       const best = hits[0];
-      return { items: best.map((it) => { const r = rows.find((rr) => rr.c.includes(it)) || { c: [it] }, nm = r.c.map((x) => x.name).filter(Boolean).sort((x, y) => y.length - x.length)[0]; return { ...it, name: it.name || nm || '', conf: it.viaPct ? 0.55 : Math.min(1, it.conf + 0.1) }; }), ok: true, dropped: drop >= 0, unique: hits.length === 1 };
+      return { items: best.map((it) => { const r = rows.find((rr) => rr.c.includes(it)) || { c: [it] }, nm = r.c.map((x) => x.name).filter(Boolean).sort((x, y) => nameScore(y) - nameScore(x) || y.length - x.length)[0]; return { ...it, name: nm || it.name || '', conf: it.viaPct ? 0.55 : Math.min(1, it.conf + 0.1) }; }), ok: true, dropped: drop >= 0, unique: hits.length === 1 };
     }
   }
   // last resort: a thin leading 1 is often lost ("¥90" for ¥190, "¥08" for ¥108): try putting it back on up to 8 lines

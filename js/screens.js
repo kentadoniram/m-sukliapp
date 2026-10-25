@@ -1,16 +1,19 @@
 // The five screens: Home, Ledger, Review, Accounts, Reports, and Settings.
 import { softDelete } from './core.js';
-import { safetyCfg } from './finance.js';
+import { safetyCfg, balanceTrail } from './finance.js';
 import {
   get, commit, commitQuiet, stamp, uid, fmt, BASE, HOME, homeFx, homeRate, CUR, balances, sortedTxs, accountMap, catMap, monthStats, monthsPresent,
   compact, monthLabel, shiftMonth, thisMonth, dayLabel, rateFor, reviewCount, groupColor, groupLetter, adjustmentCategory, nowStamp,
   replaceAll, emptyDb, live, monthParts, priv, flush, factorFor,
 } from './core.js';
 import { pace, insights, trend, totals, baselineMonths, groupTrend } from './insights.js';
-import { importBluecoins, exportCSV, SPENDABLE_TYPES } from './importer.js';
+import { importBluecoins, previewImport, exportCSV, SPENDABLE_TYPES } from './importer.js';
 import { predict } from './predict.js';
 import { modelFor, openEntry, openBulk, openCategoryForm } from './entry.js';
 import { syncNow, status as syncStatus } from './drive.js';
+import { REMOVED_UI } from './features.js';
+import { fxBlockHtml, openConverter } from './fxview.js';
+import { feedbackCfg } from './feedback.js';
 import { cloudSync, cloudStatus, signIn, signUp, signOut, signedIn, session, lastOk, SETUP_SQL, signInWithGoogle, configured } from './cloud.js';
 import { applyHide, look, setLook, ACCENTS, SIZES } from './appearance.js';
 import { lossCard } from './loans.js';
@@ -21,21 +24,30 @@ import { backupSection } from './backup.js';
 import { fetchRates, ratesStatus, RATE_CREDIT, hasLive } from './rates.js';
 import { liveRate, curName, rateFor as rateFor2 } from './core.js';
 export { accounts };
-import { esc, ic, ACT, sheet, toast, confirmDialog, promptDialog, download } from './ui.js';
+import { esc, ic, ACT, sheet, toast, confirmDialog, promptDialog, download, fileStamp } from './ui.js';
 import { nameRules, similarPairs, learnSame, learnApart, learnRelated, forget } from './merchants.js';
 import { compareCard } from './compare.js';
+import './inputlog.js';
+import { budgetBanner } from './budgetsetup.js';
 import { versionText } from './version.js';
 import { rollingSummary, rollingAvg, dailySpend, today as todayStr } from './rolling.js';
 import { buildGraph, clusters, neighbourhood, matches, explain, edgeText } from './simgraph.js';
 
-export const ui = { month: thisMonth(), q: '', filter: 'all', acct: '', limit: 120, selecting: false, sel: new Set(), by: 'group', collapsed: (() => { try { return JSON.parse(localStorage.getItem('sukli-coll') || '{}'); } catch { return {}; } })() };
+export const ui = { month: thisMonth(), q: '', filter: 'all', acct: '', from: '', to: '', cat: '', daysOff: new Set(), limit: 120, selecting: false, sel: new Set(), by: 'group', collapsed: (() => { try { return JSON.parse(localStorage.getItem('sukli-coll') || '{}'); } catch { return {}; } })() };
 
 // collapsible section: tap the heading to fold it away (remembered on this device)
 export function coll(id, title, body, extra = '') {
   const closed = !!ui.collapsed[id];
-  return `<section class="coll ${closed ? 'closed' : ''}"><div class="collrow"><button class="collhead" data-act="coll" data-id="${id}" aria-expanded="${!closed}"><h2>${title}</h2>${ic('down', 'chev')}</button>${extra}</div>${closed ? '' : `<div class="collbody">${body}</div>`}</section>`;
+  return `<section class="coll ${closed ? 'closed' : ''}"><div class="collrow"><button class="collhead" data-act="coll" data-id="${id}" aria-expanded="${!closed}"><h2>${title}</h2>${ic('down', 'chev')}</button>${extra}</div><div class="collbody" ${closed ? 'hidden' : ''}>${body}</div></section>`;
 }
-ACT.coll = (el) => { const id = el.dataset.id; ui.collapsed[id] = !ui.collapsed[id]; try { localStorage.setItem('sukli-coll', JSON.stringify(ui.collapsed)); } catch { /* blocked */ } window.dispatchEvent(new Event('sukli-render')); };
+// opening or closing a card only flips that card in place; redrawing the whole screen made the pie charts beside it flicker
+ACT.coll = (el) => {
+  const id = el.dataset.id, closed = !ui.collapsed[id]; ui.collapsed[id] = closed;
+  try { localStorage.setItem('sukli-coll', JSON.stringify(ui.collapsed)); } catch { /* blocked */ }
+  const sec = el.closest('.coll'), body = sec && sec.querySelector(':scope > .collbody');
+  if (!sec || !body) { window.dispatchEvent(new Event('sukli-render')); return; }
+  sec.classList.toggle('closed', closed); el.setAttribute('aria-expanded', String(!closed)); body.hidden = closed;
+};
 
 export const money = (n, cur = HOME) => fmt(n, cur);
 const showHome = () => get().settings.showHome !== false;
@@ -79,35 +91,94 @@ function spendable(db) {
   return { by, total, missing };
 }
 
-export function row(t, accts, cats, sel) {
+// fee entries that belong to a trade (older trades booked the fee as its own expense): child id -> parent trade
+let _kidsKey = null, _kids = new Map(), _kidsOf = new Map();
+export function tradeKids(db) {
+  const key = db.txs.length + ':' + db.txs.reduce((m, t) => Math.max(m, t.updatedAt || 0), 0);
+  if (key === _kidsKey) return { parentOf: _kids, kidsOf: _kidsOf };
+  const by = new Map(db.txs.filter((t) => !t.deleted && t.trade).map((t) => [t.id, t])); _kids = new Map(); _kidsOf = new Map();
+  for (const t of db.txs) if (!t.deleted && t.tradeOf && by.has(t.tradeOf)) { _kids.set(t.id, by.get(t.tradeOf)); if (!_kidsOf.has(t.tradeOf)) _kidsOf.set(t.tradeOf, []); _kidsOf.get(t.tradeOf).push(t); }
+  _kidsKey = key; return { parentOf: _kids, kidsOf: _kidsOf };
+}
+// the small line under an entry: what it did to your records
+export function effectLine(t, accts) {
+  const db = get(), { kidsOf, parentOf } = tradeKids(db);
+  let feeTxt = '';
+  if (t.kind === 'transfer' && t.fee > 0) feeTxt = ` · fee ${money(t.fee, t.feeCur || t.cur)} recorded as an expense`;
+  const kids = kidsOf.get(t.id) || []; for (const k of kids) feeTxt += ` · fee ${money(k.amount, k.cur)} recorded as an expense`;
+  if (t._feeOf) return `Fee of “${esc(t._feeOf)}”, saved with it. Tap to open the whole entry`;
+  if (parentOf.has(t.id)) return `Fee of “${esc(parentOf.get(t.id).name)}” recorded as an expense`;
+  if (t.loanNet) return `Loan: borrowed ${money(t.loanNet.principal, t.cur)}${t.loanNet.fees > 0 ? `, fees ${money(t.loanNet.fees, t.cur)} deducted` : ''}, received ${money(t.loanNet.net, t.cur)}`;
+  if (t.trade) return `Trade, not counted as spending${feeTxt}`;
+  if (t.kind === 'transfer') return `Moved between accounts, not counted as spending${feeTxt}`;
+  if (t.invIncome) return 'Investment income recorded';
+  if (t.autoDebt) return 'Interest on a debt, added automatically';
+  if (t.auto && t.kind === 'income') return 'Interest posted automatically';
+  return t.kind === 'income' ? 'Income recorded' : 'Expense recorded';
+}
+// "balance after": what each affected account holds right after this entry, with an arrow and colour for up or down
+function balLines(t, accts, trail) {
+  if (!trail || t._feeOf) return '';
+  const l = trail.get(t.id); if (!l) return '';
+  return l.map((x) => { const a = accts.get(x.id), up = x.after > x.before + 0.00001, dn = x.after < x.before - 0.00001, cur = a ? a.cur : '';
+    return `<small class="bal ${up ? 'up' : dn ? 'dn' : ''}"><i aria-hidden="true">${up ? '▲' : dn ? '▼' : '•'}</i><span class="sr">${up ? 'Up' : dn ? 'Down' : 'No change'}: </span><span class="bn">${esc(a ? a.name : '?')}</span> <span class="bv">${money(x.before, cur)} → <b>${money(x.after, cur)}</b></span></small>`; }).join('');
+}
+export function row(t, accts, cats, sel, trail) {
   const a = accts.get(t.acct), c = cats.get(t.cat), tr = t.kind === 'transfer';
   const group = tr ? 'Transfer' : (c ? c.group : 'Uncategorized');
   const title = t.name || (c ? c.name : 'Untitled');
-  const sub = tr ? `${esc(a ? a.name : '?')} → ${esc((accts.get(t.toAcct) || {}).name || '?')}`
+  const sub = tr ? `${t.trade ? 'Trade · ' : 'Transfer · '}${esc(a ? a.name : '?')} → ${esc((accts.get(t.toAcct) || {}).name || '?')}`
     : `${esc(c ? c.name : 'No category')} · ${esc(a ? a.name : '')}${t.items && t.items.length ? ` · ${t.items.length} items` : ''}`;
+  const bb = tr ? accts.get(t.toAcct) : null, arr = tr && t.toAmount != null && bb && Math.abs(t.toAmount - t.amount) > 1e-9 && !t.trade ? `<small class="arrived">arrived ${money(t.toAmount, bb.cur)}</small>` : '';
   const signed = tr ? money(t.amount, t.cur) : money(t.kind === 'income' ? t.amount : -t.amount, t.cur);
   const base = !tr && eq(t.amount, t.cur, t.fx, t.date) ? `<small>${eq(t.amount, t.cur, t.fx, t.date)}</small>` : '';
   const on = sel && ui.sel.has(t.id);
   return `<button class="row ${sel ? 'selrow' : ''} ${on ? 'picked' : ''}" data-act="${sel ? 'sel-toggle' : 'edit'}" data-id="${t.id}" ${sel ? `role="checkbox" aria-checked="${!!on}"` : ''}>
     ${sel ? `<i class="selbox ${on ? 'on' : ''}">${on ? ic('check') : ''}</i>` : ''}
     <i class="badge" style="background:${tr ? 'var(--xfer)' : groupColor(group)}">${groupLetter(group)}</i>
-    <span class="rmain"><strong><span class="tt">${esc(title)}</span>${t.flag === 'review' ? '<em class="pill">Check</em>' : ''}</strong><small>${sub}</small></span>
-    <span class="ramt ${t.kind}"><b>${t.kind === 'income' ? '+' : ''}${signed}</b>${base}</span></button>`;
+    <span class="rmain"><strong><span class="tt">${esc(title)}</span>${t.flag === 'review' ? '<em class="pill">Check</em>' : ''}</strong><small>${sub}</small><small class="eff">${effectLine(t, accts)}</small>${balLines(t, accts, trail)}</span>
+    <span class="ramt ${t.kind}"><b>${t.kind === 'income' ? '+' : ''}${signed}</b>${base}${arr}</span></button>`;
 }
 ACT.edit = (el) => { const t = get().txs.find((x) => x.id === el.dataset.id); if (t && t.auto && t.kind === 'income' && openInterestDetail(t)) return; openEntry({ id: el.dataset.id }); };
-ACT.add = () => openEntry();
+ACT.add = async () => {
+  // on the Investments tab the + button asks which account and what kind of entry
+  if ((location.hash.replace(/^#\/?/, '').split('?')[0]) === 'invest') { (await import('./invest.js')).invEntryMenu(); return; }
+  openEntry();
+};
 ACT.bulk = () => openBulk();
 
 // ---------------- Home ----------------
 const sum = (a) => a.reduce((x, y) => x + y, 0);
 const R = (n) => fmt(n, HOME, { round: true });
 
+const homeTitles = (h) => h.replace(/(<button class="collhead"[^>]*><h2>)([^<]*)(<\/h2>)/g, (m, a, t, c) => a + titleCase(t) + c).replace(/(<h3 class="subh">)([^<]*)/g, (m, a, t) => a + titleCase(t));
 export function home(db) {
   const st = monthStats(db, ui.month);
   const lay = homeLayout(db);
   const body = lay.order.filter((id) => !lay.hidden.includes(id)).map((id) => { const sec = HOME_SECTIONS.find((x) => x[0] === id); if (!sec) return ''; return sec[2] ? `<div class="defer" data-defer="${id}" aria-busy="true"></div>` : homeSection(id, { db }); }).join('');
+  const firstEntry = !db.txs.some((t) => !t.deleted) ? `<section class="nextstep"><b>Next step: write down your first spending.</b><br>Tap the round <b>+</b> button below. Type what it was (for example “lunch”), how much, and pick the account you paid from. Sukli learns your usual choices as you go.</section>` : '';
   return `${monthNav()}
-    ${strip(st)}${body}`;
+    ${firstEntry}${strip(st)}${homeTitles(weekBars(db) + body)}`;
+}
+// what was spent on each of the last 7 days: plain HTML (not SVG) so the day, the bar and the amount never overlap and the text stays readable.
+// Horizontal or vertical is a device choice; the data and the numbers are the same in both.
+const weekMode = () => { try { return localStorage.getItem('sukli-week') === 'h' ? 'h' : 'v'; } catch { return 'v'; } };
+ACT['week-mode'] = (el) => {
+  try { localStorage.setItem('sukli-week', el.dataset.v); } catch { /* blocked */ }
+  const sec = document.querySelector('.week'); if (sec) sec.outerHTML = weekBars(get());
+  if (el.closest('.seg')) { el.closest('.seg').querySelectorAll('button').forEach((b) => { const on = b.dataset.v === el.dataset.v; b.classList.toggle('on', on); b.setAttribute('aria-pressed', String(on)); }); }
+};
+function weekBars(db) {
+  const { dates, vals } = dailySpend(db, todayStr(), 7), base = dayBaseline(db), cl = (i) => dayColor(vals[i], base), top = Math.max(...vals), total = vals.reduce((a, b) => a + b, 0), mode = weekMode();
+  const day = (d, i) => (i === 6 ? 'Today' : new Date(d + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'short' }));
+  const full = (d, i) => (i === 6 ? 'Today' : i === 5 ? 'Yesterday' : new Date(d + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'short', day: 'numeric' }));
+  // a long amount is shortened (12.3k) so neighbouring labels never touch
+  const amt = (v) => (v < 10 ? money(v) : compact(v));
+  let body;
+  if (!total) body = '<p class="empty">Nothing spent in the last 7 days.</p>';
+  else if (mode === 'v') body = `<div class="wkv" role="img" aria-label="Spending for each of the last 7 days">${dates.map((d, i) => `<div class="wc ${i === 6 ? 'now' : ''}" data-tip="${esc(full(d, i) + ': ' + (vals[i] ? money(vals[i]) : 'nothing spent'))}"><span class="wa ${vals[i] ? '' : 'muted'}" ${cl(i) ? `style="color:${cl(i)}"` : ''}>${vals[i] ? esc(amt(vals[i])) : ''}</span><span class="wb"><i style="height:${vals[i] > 0 ? Math.max(3, Math.round(vals[i] / top * 100)) : 0}%${cl(i) ? `;background:${cl(i)}` : ''}"></i></span><span class="wl">${esc(day(d, i))}</span></div>`).join('')}</div>`;
+  else body = dates.map((d, i) => `<div class="wk ${i === 6 ? 'now' : ''}"><span class="wd">${esc(full(d, i))}</span><span class="wtrack"><i style="width:${vals[i] > 0 ? Math.max(2, Math.round(vals[i] / top * 100)) : 0}%${cl(i) ? `;background:${cl(i)}` : ''}"></i></span><b class="wv ${vals[i] ? '' : 'muted'}" ${cl(i) ? `style="color:${cl(i)}"` : ''}>${vals[i] ? esc(money(vals[i])) : '–'}</b></div>`).join('');
+  return `<section class="week" aria-label="Spending in the last 7 days"><div class="weekhead"><h3 class="subh">Spent each day, last 7 days <small class="muted">${total ? money(total) + ' in all' : ''}</small></h3></div>${body}</section>`;
 }
 // the cards on Home, in the order you chose in Settings. [id, name, heavy: drawn a moment later so the numbers above appear at once]
 export const HOME_SECTIONS = [
@@ -123,7 +194,7 @@ export function homeLayout(db) {
 export function fillDeferred(db, done) {
   const ctxOf = () => { const st = monthStats(db, ui.month); return { db, st, accts: accountMap(db), cats: catMap(db) }; };
   const els = [...document.querySelectorAll('[data-defer]')];
-  els.forEach((el, i) => setTimeout(() => { try { if (!el.isConnected) return; el.outerHTML = homeSection(el.dataset.defer, ctxOf()); } catch (e) { el.remove(); } }, 16 * (i + 1)));
+  els.forEach((el, i) => setTimeout(() => { try { if (!el.isConnected) return; el.outerHTML = homeTitles(homeSection(el.dataset.defer, ctxOf())); } catch (e) { el.remove(); } }, 16 * (i + 1)));
   if (done) setTimeout(done, 16 * (els.length + 1) + 30);
 }
 function homeSection(id, c) {
@@ -132,7 +203,7 @@ function homeSection(id, c) {
     case 'spendable': { const sp = spendable(db), chips = [...sp.by.entries()].filter(([, v]) => Math.abs(v) >= 0.005).map(([cur, v]) => { const e = eq(v, cur, rateFor(db, cur)); return `<span>${money(v, cur)}${e ? `<small> ${e}</small>` : ''}</span>`; }).join('');
       return `<section class="spendable"><div><span>Spendable now</span><b>${money(sp.total)}</b></div><div class="curs">${chips || '<span class="muted">No balances yet</span>'}</div>
       ${sp.missing.length ? `<p class="hint">Not counted: ${sp.missing.join(', ')} (set a rate in Settings).</p>` : ''}</section>`; }
-    case 'alerts': { const n = reviewCount(db); return `${reminderBanner(db)}${n ? `<a class="banner" href="#/review"><strong>${n} ${n === 1 ? 'entry needs' : 'entries need'} a quick check</strong><span>Confirm the guessed categories</span>${ic('right')}</a>` : ''}`; }
+    case 'alerts': { const n = reviewCount(db); return `${reminderBanner(db)}${budgetBanner(db)}${n ? `<a class="banner" href="#/review"><strong>${n} ${n === 1 ? 'entry needs' : 'entries need'} a quick check</strong><span>Confirm the guessed categories</span>${ic('right')}</a>` : ''}`; }
     case 'insights': { const ins = insights(db, ui.month); return ins.length ? coll('h-ins', 'Worth knowing', `<ul class="ins">${ins.map((x) => `<li class="${x.tone}">${x.id ? `<button class="insb" data-act="edit" data-id="${x.id}">${esc(x.text)}</button>` : esc(x.text)}</li>`).join('')}</ul>`) : ''; }
     case 'loss': return lossCard(db, ui.month, coll, (n) => money(n));
     case 'pace': return paceCard(db);
@@ -149,9 +220,25 @@ function homeSection(id, c) {
     default: return '';
   }
 }
+// the share written outside the pie with a short leader line to its slice (readable without telling colours apart);
+// labels on the same side are pushed apart so they never overlap; tiny slices are left to the legend
+export function pieLabels(shares, { cx = 70, cy = 70, r = 52, hw = 13, min = 0.03 } = {}) {
+  let acc = 0; const L = [];
+  shares.forEach((sh) => { const mid = acc + sh / 2; acc += sh; if (!(sh >= min)) return; const a = mid * 2 * Math.PI - Math.PI / 2, c = Math.cos(a), sn = Math.sin(a), R1 = r + hw + 1, R2 = R1 + 7;
+    L.push({ sh, side: c >= 0 ? 1 : -1, p1: [cx + R1 * c, cy + R1 * sn], p2: [cx + R2 * c, cy + R2 * sn], y: cy + R2 * sn }); });
+  for (const side of [1, -1]) { const g = L.filter((l) => l.side === side).sort((a, b) => a.y - b.y); for (let k = 1; k < g.length; k++) if (g[k].y - g[k - 1].y < 14) g[k].y = g[k - 1].y + 14; }
+  return L.map((l) => { const tx = l.p2[0] + l.side * 4;
+    return `<polyline class="pie-lead" points="${l.p1[0].toFixed(1)},${l.p1[1].toFixed(1)} ${l.p2[0].toFixed(1)},${l.p2[1].toFixed(1)} ${tx.toFixed(1)},${l.y.toFixed(1)}" fill="none"/><text class="slice-pct" x="${(tx + l.side * 2).toFixed(1)}" y="${(l.y + 3.8).toFixed(1)}" text-anchor="${l.side > 0 ? 'start' : 'end'}">${Math.round(l.sh * 100)}%</text>`; }).join('');
+}
 // Where it went: bars or a pie with the share on its right (a device choice)
 const wentMode = () => { try { return localStorage.getItem('sukli-went') === 'pie' ? 'pie' : 'bars'; } catch { return 'bars'; } };
-ACT['went-mode'] = (el) => { try { localStorage.setItem('sukli-went', el.dataset.v); } catch { /* blocked */ } window.dispatchEvent(new Event('sukli-render')); };
+// switching Bars/Pie replaces only this card, not the whole screen, so nothing else on Home flashes
+ACT['went-mode'] = (el) => {
+  try { localStorage.setItem('sukli-went', el.dataset.v); } catch { /* blocked */ }
+  const sec = el.closest('.coll');
+  if (sec && sec.querySelector('.collhead[data-id="h-out"]')) { const y = window.scrollY; sec.outerHTML = homeSection('went', { db: get() }); window.scrollTo(0, y); return; }
+  window.dispatchEvent(new Event('sukli-render'));
+};
 const wentToggle = () => `<div class="seg two small" role="group" aria-label="Show as">${[['bars', 'Bars'], ['pie', 'Pie']].map(([v, l]) => `<button type="button" data-act="went-mode" data-v="${v}" class="${wentMode() === v ? 'on' : ''}" aria-pressed="${wentMode() === v}">${l}</button>`).join('')}</div>`;
 function wentPie(all, total) {
   const top = all.slice(0, 7), rest = all.slice(7).reduce((a, [, v]) => a + v, 0), slices = top.map(([g, v]) => ({ g, v })); if (rest > 0) slices.push({ g: 'Everything else', v: rest, other: true });
@@ -159,7 +246,8 @@ function wentPie(all, total) {
   const arcs = slices.map((x) => { const len = total ? (x.v / total) * C : 0, d = Math.max(0, len - 1.5);
     const el = `<circle class="slice" data-act="${x.other ? 'went-mode' : 'grp'}" ${x.other ? 'data-v="bars"' : `data-g="${esc(x.g)}" data-k="expense"`} data-tip="${esc(`${x.g}: ${money(x.v)} (${total ? Math.round((x.v / total) * 100) : 0}%)`)}" cx="70" cy="70" r="52" fill="none" stroke="${groupColor(x.other ? 'Others' : x.g)}" stroke-width="26" stroke-dasharray="${d.toFixed(2)} ${(C - d).toFixed(2)}" stroke-dashoffset="${(-acc).toFixed(2)}" transform="rotate(-90 70 70)"></circle>`;
     acc += len; return el; }).join('');
-  return `<div class="wentpie"><svg class="donut sm" viewBox="0 0 140 140" role="img" aria-label="Where the money went">${arcs}<text x="70" y="68" text-anchor="middle" class="dl">Spent</text><text x="70" y="86" text-anchor="middle" class="dv">${esc(compact(total, ''))}</text></svg>
+  const labels = pieLabels(slices.map((x) => (total ? x.v / total : 0)));
+  return `<div class="wentpie"><svg class="donut sm" viewBox="-30 -12 200 164" role="img" aria-label="Where the money went">${arcs}${labels}<text x="70" y="68" text-anchor="middle" class="dl">Spent</text><text x="70" y="86" text-anchor="middle" class="dv">${esc(compact(total, ''))}</text></svg>
     <ul class="pielegend">${slices.map((x) => `<li><button type="button" data-act="${x.other ? 'went-mode' : 'grp'}" ${x.other ? 'data-v="bars"' : `data-g="${esc(x.g)}" data-k="expense"`}><i class="dot2" style="background:${groupColor(x.other ? 'Others' : x.g)}"></i><span class="pl">${esc(x.g)}</span><b class="pp">${total ? Math.round((x.v / total) * 100) : 0}%</b><small>${money(x.v)}</small></button></li>`).join('')}</ul></div><p class="hint tap">Tap a slice or a name for the detail.</p>`;
 }
 
@@ -221,6 +309,7 @@ function paceCard(db) {
       ${proj}
       <path d="${line(p.cur, p.day)}" stroke="var(--line)" stroke-width="2.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
       <circle cx="${X(last).toFixed(1)}" cy="${Y(p.cur[last]).toFixed(1)}" r="3.5" fill="var(--line)"/></svg>
+    <p class="hint pacecap"><b>Pace</b> is how fast you are spending. The line shows what you have spent so far this month, day by day, next to last month. If your line is above last month’s, you are spending faster than last month.</p>
     <p class="legend"><i class="k lineb"></i>${esc(monthLabel(ui.month).split(' ')[0])} <i class="k bar"></i>${esc(monthLabel(p.prevYm).split(' ')[0])}${p.live ? ' <i class="k dash"></i>at this pace' : ''}</p>
     <div class="facts">
       <div><span>Daily average, last 7 days</span><b>${R(rollEnd(p).now)}</b></div>
@@ -315,44 +404,119 @@ function ledgerRows(db) {
   const accts = accountMap(db), cats = catMap(db);
   const q = ui.q.trim().toLowerCase();
   let list = sortedTxs(db);
-  if (!q) list = list.filter((t) => t.date.startsWith(ui.month));
+  const ranged = !!(ui.from || ui.to);
+  if (ranged) list = list.filter((t) => (!ui.from || t.date.slice(0, 10) >= ui.from) && (!ui.to || t.date.slice(0, 10) <= ui.to));
+  else if (!q) list = list.filter((t) => t.date.startsWith(ui.month));
+  const feeSource = ui.filter === 'expense' ? list.filter((t) => t.kind === 'transfer' && t.fee > 0) : [];   // fees saved on transfers, trades and loans are expenses too
   if (ui.filter === 'review') list = list.filter((t) => t.flag === 'review');
   else if (ui.filter !== 'all') list = list.filter((t) => t.kind === ui.filter);
   if (ui.acct) list = list.filter((t) => t.acct === ui.acct || t.toAcct === ui.acct);
+  if (ui.cat) { const isG = ui.cat.startsWith('g:'), key = ui.cat.slice(2); list = list.filter((t) => { const c = cats.get(t.cat); return c && (isG ? c.group === key : c.id === key); }); }
+  if (feeSource.length) {
+    const fa = (t) => (t.feeBy === 'to' ? t.toAcct : t.acct);
+    const fees = feeSource.filter((t) => !ui.acct || fa(t) === ui.acct).map((t) => ({ ...t, _feeOf: t.name || 'transfer', kind: 'expense', amount: t.fee, cur: t.feeCur || t.cur, fx: t.feeFx, name: `Fee · ${t.name || (t.trade ? 'trade' : 'transfer')}`, cat: t.feeCat, acct: fa(t), toAcct: undefined, fee: 0, items: [], trade: false, loanNet: undefined, flag: undefined }));
+    list = [...list, ...fees].sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+  }
   if (q) list = list.filter((t) => {
     const c = cats.get(t.cat), a = accts.get(t.acct);
     return [t.name, t.notes, c && c.name, c && c.group, a && a.name, (t.items || []).map((i) => i.n).join(' ')].join(' ').toLowerCase().includes(q);
   });
-  const total = list.length;
+  // a fee that belongs to a trade is shown inside the trade's row, not as a separate entry (still searchable, and in the Expense filter)
+  const kidMap = tradeKids(db).parentOf, hideKids = !q && ui.filter !== 'expense';
+  const hiddenFees = hideKids ? list.filter((t) => kidMap.has(t.id) && list.some((p) => p.id === kidMap.get(t.id).id)) : [];
+  if (hiddenFees.length) { const hs = new Set(hiddenFees.map((t) => t.id)); list = list.filter((t) => !hs.has(t.id)); }
+  const total = list.length, trail = balanceTrail(db);
+  const sumHtml = filterSummary(db, list, hiddenFees, kidMap);
   list = list.slice(0, ui.limit);
-  let html = '', day = '', dayTotal = 0, buf = ''; const shown = []; ui.shown = shown;
-  const flush = () => { if (buf) html += `<div class="day"><div class="dayhead"><span>${dayLabel(day)}</span><span>${dayTotal ? money(-dayTotal) : ''}</span></div><div class="rows">${buf}</div></div>`; buf = ''; dayTotal = 0; };
+  let html = '', day = '', dayTotal = 0, buf = '', byCur = new Map(), n = 0; const shown = []; ui.shown = shown;
+  const flush = () => { if (buf) { const off = ui.daysOff.has(day), col = '', curs = [...byCur.entries()].sort((a, b) => (a[0] === HOME ? 1 : b[0] === HOME ? -1 : 0)), foreign = curs.some(([c]) => c !== HOME);
+    const lines = curs.map(([c, v]) => `<span class="dline">${money(-v, c)}</span>`).join('');
+    html += `<div class="day ${off ? 'off' : ''}"><button type="button" class="dayhead" data-act="day-toggle" data-d="${day}" aria-expanded="${!off}"><span class="dcaret">${off ? '▸' : '▾'}</span><span class="dlabel">${dayLabel(day)}${off ? ` <small class="muted">${n} ${n === 1 ? 'entry' : 'entries'}</small>` : ''}</span><span class="dtot" ${col ? `style="color:${col}"` : ''}>${dayTotal ? (foreign ? `${lines}<small class="dcur">${money(-dayTotal)}</small>` : `<span class="dline">${money(-dayTotal)}</span>`) : ''}</span></button><div class="rows" ${off ? 'hidden' : ''}>${buf}</div></div>`; } buf = ''; dayTotal = 0; byCur = new Map(); n = 0; };
   for (const t of list) {
     const d = t.date.slice(0, 10);
     if (d !== day) { flush(); day = d; }
-    buf += row(t, accts, cats, ui.selecting); shown.push(t.id);
-    if (t.kind === 'expense') dayTotal += t.amount * factorFor(db, t);
-    else if (t.kind === 'income') dayTotal -= 0;
+    buf += row(t, accts, cats, ui.selecting, trail); shown.push(t.id); n++;
+    if (t.kind === 'expense') { dayTotal += t.amount * factorFor(db, t); byCur.set(t.cur, (byCur.get(t.cur) || 0) + t.amount); }
+    for (const k of hiddenFees) if (kidMap.get(k.id).id === t.id) { dayTotal += k.amount * factorFor(db, k); byCur.set(k.cur, (byCur.get(k.cur) || 0) + k.amount); }
   }
   flush();
-  if (!html) html = `<p class="empty">${q ? 'No entries match your search.' : 'No entries here.'}</p>`;
+  if (!html) html = `<p class="empty">${q ? 'No entries match your search.' : ui.filter === 'review' ? 'Nothing to check. Every entry this month is confirmed.' : 'No entries here.'}</p>`;
   if (total > list.length) html += `<button class="btn ghost wide" data-act="more">Show more (${total - list.length} left)</button>`;
-  return html;
+  return sumHtml + html;
+}
+// what a normal day costs: the median of your last 60 days that had spending (home currency)
+function dayBaseline(db) {
+  try { const v = dailySpend(db, todayStr(), 60).vals.filter((x) => x > 0).sort((a, b) => a - b); return v.length >= 5 ? v[v.length >> 1] : 0; } catch { return 0; }
+}
+// green when the day was cheaper than a normal day, through amber, to dark red when it was much dearer
+function dayColor(v, base) {
+  if (!v || !base) return '';
+  const r = Math.min(2.2, Math.max(0.3, v / base)), x = r <= 1 ? (r - 0.3) / 0.7 * 0.5 : 0.5 + (r - 1) / 1.2 * 0.5;
+  const hue = 135 - x * 135, light = 36 - Math.max(0, x - 0.5) * 12;
+  return `hsl(${hue.toFixed(0)} 70% ${light.toFixed(0)}%)`;
+}
+// when a filter, a category or a date range is on, show what the selection adds up to
+function filterSummary(db, list, hiddenFees, kidMap) {
+  const on = ui.filter !== 'all' || ui.cat || ui.from || ui.to || ui.acct || ui.q.trim();
+  if (!on) return '';
+  const acc = { expense: new Map(), income: new Map(), transfer: new Map() }, hm = { expense: 0, income: 0, transfer: 0 }, cnt = { expense: 0, income: 0, transfer: 0 };
+  const add = (t) => { const k = acc[t.kind] ? t.kind : null; if (!k) return; cnt[k]++; acc[k].set(t.cur, (acc[k].get(t.cur) || 0) + t.amount); hm[k] += t.amount * factorFor(db, t); };
+  const seen = new Set(list.map((t) => t.id));
+  for (const t of list) add(t);
+  for (const k of hiddenFees || []) if (!seen.has(k.id)) add(k);
+  const cats = catMap(db);
+  const catName = ui.cat ? (ui.cat.startsWith('g:') ? ui.cat.slice(2) : ((cats.get(ui.cat) || {}).name || '')) : '';
+  const range = ui.from || ui.to ? `${ui.from || 'start'} to ${ui.to || 'today'}` : '';
+  // which dates the totals cover: the chosen range, otherwise the month shown (a search looks at every date)
+  const period = ui.from || ui.to ? `${ui.from ? fshort(ui.from) : 'the first entry'} to ${ui.to ? fshort(ui.to) : 'today'}` : (ui.q.trim() ? 'all dates' : monthLabel(ui.month));
+  const title = [catName, range, ui.filter !== 'all' ? (ui.filter === 'review' ? 'Check' : ui.filter[0].toUpperCase() + ui.filter.slice(1)) : ''].filter(Boolean).join(' · ') || 'This selection';
+  const line = (label, k) => { if (!cnt[k]) return ''; const cur = [...acc[k].entries()].map(([c, v]) => money(v, c)).join(' · '); return `<div class="sumrow"><span>${label} <small class="muted">${cnt[k]} ${cnt[k] === 1 ? 'entry' : 'entries'}</small></span><b>${money(hm[k])}</b>${acc[k].size > 1 || ![...acc[k].keys()].every((c) => c === HOME) ? `<small class="muted">${cur}</small>` : ''}</div>`; };
+  const inner = line('Total spent', 'expense') + line('Income received', 'income') + line('Moved between accounts', 'transfer');
+  return `<div class="fsum" id="lsum"><b class="fsumtitle">${esc(title)}</b><small class="muted fsumrange">Dates covered: ${esc(period)}</small>${inner || '<span class="muted">Nothing matches.</span>'}</div>`;
 }
 ACT.more = () => { ui.limit += 150; const el = document.getElementById('ledger-list'); if (el) el.innerHTML = ledgerRows(get()); };
 
+function catOptions(db) {
+  const live = db.categories.filter((c) => !c.deleted), groups = [...new Set(live.map((c) => c.group))].sort();
+  return `<option value="">All categories</option>` + groups.map((g) => `<optgroup label="${esc(g)}"><option value="g:${esc(g)}" ${ui.cat === 'g:' + g ? 'selected' : ''}>All of ${esc(g)}</option>${live.filter((c) => c.group === g).sort((a, b) => a.name.localeCompare(b.name)).map((c) => `<option value="${c.id}" ${ui.cat === c.id ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</optgroup>`).join('');
+}
+const ledgerRefresh = () => { const l = document.getElementById('ledger-list'); if (l) l.innerHTML = ledgerRows(get()); };
+ACT['day-toggle'] = (el) => { const d = el.dataset.d; if (ui.daysOff.has(d)) ui.daysOff.delete(d); else ui.daysOff.add(d); const box = el.closest('.day'); if (box) { const off = ui.daysOff.has(d); box.classList.toggle('off', off); el.setAttribute('aria-expanded', String(!off)); const r = box.querySelector('.rows'); if (r) r.hidden = off; el.querySelector('.dcaret').textContent = off ? '▸' : '▾'; } };
+const fshort = (d) => new Date(d + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+ACT['f-pick'] = async (el) => { const k = el.dataset.k, { openDatePicker } = await import('./datepicker.js'); openDatePicker(ui[k] || todayStr(), (v) => { ui[k] = v.slice(0, 10); if (ui.from && ui.to && ui.from > ui.to) { if (k === 'from') ui.to = ui.from; else ui.from = ui.to; } ui.limit = 120; window.dispatchEvent(new Event('sukli-render')); }, { time: false, title: k === 'from' ? 'From which day?' : 'Up to which day?' }); };
+ACT['f-range'] = (el) => { const v = el.dataset.v, t = todayStr(), d = new Date(); const sub = (n) => { const x = new Date(); x.setDate(x.getDate() - n); return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}`; };
+  if (v === '7') { ui.from = sub(6); ui.to = t; } else if (v === '30') { ui.from = sub(29); ui.to = t; } else if (v === 'm') { ui.from = `${t.slice(0, 7)}-01`; ui.to = t; } else { ui.from = `${t.slice(0, 4)}-01-01`; ui.to = t; }
+  ui.limit = 120; window.dispatchEvent(new Event('sukli-render')); };
+ACT['f-clear'] = () => { ui.from = ui.to = ui.cat = ''; ui.filter = 'all'; ui.acct = ''; ui.q = ''; window.dispatchEvent(new Event('sukli-render')); };
 export function ledger(db) {
   const f = [['all', 'All'], ['review', 'Check'], ['expense', 'Expense'], ['income', 'Income'], ['transfer', 'Transfer']];
   return `${monthNav()}
     <div class="searchbar">${ic('search')}<input id="q" type="search" placeholder="Search entries, items, notes" value="${esc(ui.q)}" aria-label="Search entries"></div>
-    <div class="filters" role="group" aria-label="Filter">${f.map(([v, l]) => `<button class="chip ${ui.filter === v ? 'on' : ''}" data-act="filter" data-v="${v}">${l}</button>`).join('')}
-      <select id="acctfilter" aria-label="Account filter"><option value="">All accounts</option>${db.accounts.filter((a) => !a.deleted).sort((a, b) => a.name.localeCompare(b.name)).map((a) => `<option value="${a.id}" ${ui.acct === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select></div>
+    <div class="filters" role="group" aria-label="Filter">${f.map(([v, l]) => `<button class="chip ${ui.filter === v ? 'on' : ''}" data-act="filter" data-v="${v}" ${v === 'review' ? 'title="Entries with a guessed category or label that you have not confirmed yet"' : ''}>${l}</button>`).join('')}</div>
+    <div class="frow2">
+      <div class="frange"><button type="button" class="fdbtn ${ui.from ? 'set' : ''}" data-act="f-pick" data-k="from" aria-label="From date"><small>From</small><b>${ui.from ? esc(fshort(ui.from)) : 'Any date'}</b></button><span class="fdash" aria-hidden="true">–</span><button type="button" class="fdbtn ${ui.to ? 'set' : ''}" data-act="f-pick" data-k="to" aria-label="To date"><small>To</small><b>${ui.to ? esc(fshort(ui.to)) : 'Any date'}</b></button></div>
+      <div class="fquick" role="group" aria-label="Quick ranges">${[['7', 'Last 7 days'], ['30', 'Last 30 days'], ['m', 'This month'], ['y', 'This year']].map(([v, l]) => `<button type="button" class="chip" data-act="f-range" data-v="${v}">${l}</button>`).join('')}</div>
+    </div>
+    <div class="frow3">
+      <select id="acctfilter" aria-label="Account filter"><option value="">All accounts</option>${db.accounts.filter((a) => !a.deleted).sort((a, b) => a.name.localeCompare(b.name)).map((a) => `<option value="${a.id}" ${ui.acct === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select>
+      <label class="fcat"><select id="lf-cat" aria-label="Category filter">${catOptions(db)}</select></label>
+      <button type="button" class="btn sm ghost" data-act="f-clear">Clear all</button></div>
+    <p class="hint filterhint" id="filterhint">${filterHint()}</p>
     <div id="selbar-wrap">${selBar()}</div>
     <div id="ledger-list">${ledgerRows(db)}</div>`;
 }
+// one line under the filters saying what the chosen filter shows
+const FILTER_HINTS = {
+  review: 'Check means Sukli guessed something for you (the category or the label) and you have not confirmed it yet. Open an entry and save it to confirm, or use Review in the menu to go through them one by one. Nothing is wrong with the money itself.',
+  expense: 'Money you spent. Fees from trades, transfers and loans are listed here too, each one pointing to its entry.',
+  transfer: 'Money moved between your own accounts, including trades. Not counted as spending, and fees are not listed here (see Expense).',
+  income: 'Money that came in.',
+  all: '',
+};
+const filterHint = () => esc(FILTER_HINTS[ui.filter] || '');
 // choose several entries and delete them together (they go to the recycle bin and can be undone)
 function selBar() {
-  if (!ui.selecting) return `<div class="btnrow left selstart"><button type="button" class="btn sm ghost" data-act="sel-start">${ic('check')} Select entries</button></div>`;
+  if (!ui.selecting) return `<div class="btnrow left selstart"><button type="button" class="btn sm ghost" data-act="sel-start">${ic('check')} Select entries</button><button type="button" class="btn sm ghost" data-act="ih-open">Input history</button></div>`;
   const n = ui.sel.size;
   return `<div class="selbar" role="toolbar" aria-label="Selected entries"><span><b>${n}</b> selected</span><button type="button" class="btn sm ghost" data-act="sel-all">${n && n >= (ui.shown || []).length ? 'Clear' : 'Select all shown'}</button><button type="button" class="btn sm danger" data-act="sel-del" ${n ? '' : 'disabled'}>${ic('trash')} Delete (${n})</button><button type="button" class="btn sm ghost" data-act="sel-end">Done</button></div>`;
 }
@@ -369,12 +533,13 @@ ACT['sel-del'] = async () => {
   ui.selecting = false; ui.sel = new Set();
   toast(`${gone.length} moved to the recycle bin`, { undo: () => commit((d) => { for (const t of d.txs) if (gone.includes(t.id)) { t.deleted = false; delete t.deletedAt; stamp(t); } }) });
 };
-ACT.filter = (el) => { ui.filter = el.dataset.v; ui.limit = 120; window.dispatchEvent(new Event('sukli-render')); };
+ACT.filter = (el) => { ui.filter = el.dataset.v; const h = document.getElementById('filterhint'); if (h) h.textContent = FILTER_HINTS[ui.filter] || ''; ui.limit = 120; window.dispatchEvent(new Event('sukli-render')); };
 export function bindLedger() {
   const q = document.getElementById('q');
   if (q) q.oninput = () => { ui.q = q.value; ui.limit = 120; document.getElementById('ledger-list').innerHTML = ledgerRows(get()); };
   const a = document.getElementById('acctfilter');
   if (a) a.onchange = () => { ui.acct = a.value; document.getElementById('ledger-list').innerHTML = ledgerRows(get()); };
+  for (const [id, k] of [['lf-cat', 'cat']]) { const e = document.getElementById(id); if (e) e.onchange = () => { ui[k] = e.value; ui.limit = 120; ledgerRefresh(); }; }
 }
 
 // ---------------- Review ----------------
@@ -489,6 +654,11 @@ ACT['budget-clear'] = (el) => commit((d) => { const b = d.budgets.find((x) => !x
 const segBtns = (act, k, opts, cur) => `<div class="seg sm" role="group">${opts.map(([v, l]) => `<button type="button" data-act="${act}" data-k="${k}" data-v="${v}" class="${String(cur) === String(v) ? 'on' : ''}" aria-pressed="${String(cur) === String(v)}">${l}</button>`).join('')}</div>`;
 ACT['rates-now'] = async () => { try { await fetchRates(); } catch (e) { /* status already shown */ } };
 ACT['rate-live'] = (el) => commit((d) => { delete d.settings.rates[el.dataset.c]; });
+// Settings: open the converter for one currency; saving makes it a manual rate, "Back to live" removes the override
+ACT['rate-open'] = (el) => { const c = el.dataset.c, db = get();
+  openConverter({ from: c, to: HOME, amount: 1, rate: homeFx(db, c), applyLabel: 'Save as my rate',
+    onApply: ({ rate }) => commit((d) => { const hr = (d.settings.rates && d.settings.rates[HOME] > 0 ? d.settings.rates[HOME] : rateFor(d, HOME)) || 1; d.settings.rates = d.settings.rates || {}; d.settings.rates[c] = rate * (HOME === BASE ? 1 : hr); }),
+    onReset: () => commit((d) => { if (d.settings.rates) delete d.settings.rates[c]; }) }); };
 ACT['home-cur'] = () => openCurrencyPicker(async (c) => {
   const db = get(); if (c === HOME) return;
   if (!(await confirmDialog(`Show totals in ${c} (${curName(c)}) from now on? Budgets and limits you set will be converted at today’s rate. Nothing else is rewritten.`, 'Change'))) return;
@@ -516,7 +686,8 @@ export function settings(db) {
       <div class="btnrow left"><a class="btn" href="#/categories?k=expense">Expense categories</a><a class="btn ghost" href="#/categories?k=income">Income categories</a></div></section>
     ${(() => { const own = [...new Set([...Object.keys(db.settings.curDec || {}), ...db.accounts.filter((a) => !a.deleted && a.type === 'crypto').map((a) => a.cur)])]; return own.length ? `<section><h2>Coins and tokens: decimals</h2><p class="hint">How many decimals to show for coins and tokens (for example MNT as Mantle, or BBSOL).</p>${own.map((c) => `<label class="field inline"><span>${esc(c)}</span><select data-curdec="${esc(c)}">${[2, 4, 6, 8].map((n) => `<option ${CUR[c].dec === n ? 'selected' : ''}>${n}</option>`).join('')}</select><span>decimals</span></label>`).join('')}</section>` : ''; })()}
     ${(() => { const r = nameRules(), groups = new Map(); for (const [a, k] of Object.entries(r.same)) { if (!groups.has(k)) groups.set(k, []); groups.get(k).push(a); }
-      return `<section id="nmatch"><h2>Name matching</h2><label class="field"><span>Home stop (optional)</span><input id="homeplace" value="${esc(s.homePlace || '')}" placeholder="e.g. San Pedro" autocomplete="off"><small class="muted">Used to guess the direction of a trip: in the morning you leave it, in the evening you come back. Left empty, Sukli works it out from your trips.</small></label><p class="hint">Teach Sukli which names mean the same thing (“starbucks antipolo” and “starbucks tagaytay”) and which do not (“tennis” the sport and “tennis socks”). It also asks when you type a new name that looks like an old one.</p>
+      return `<section id="nmatch"><h2>Name matching</h2><label class="field"><span>Home stop (optional)</span><input id="homeplace" value="${esc(s.homePlace || '')}" placeholder="e.g. San Pedro" autocomplete="off"><small class="muted">The stop you leave in the morning and come back to in the evening. Left empty, Sukli works it out from your trips.</small></label>
+      <label class="field"><span>Workplace stop (optional)</span><input id="workplace" value="${esc(s.workPlace || '')}" placeholder="e.g. Shinagawa" autocomplete="off"><small class="muted">Sukli remembers it: on weekday mornings it suggests home to work, and in the evening work to home.</small></label><p class="hint">Teach Sukli which names mean the same thing (“starbucks antipolo” and “starbucks tagaytay”) and which do not (“tennis” the sport and “tennis socks”). It also asks when you type a new name that looks like an old one.</p>
       <button type="button" class="btn ghost wide" data-act="nm-review">Review similar names</button>
       <button type="button" class="btn ghost wide" data-act="nm-map">Name map (how names connect)</button>
       ${[...groups.entries()].map(([k, as]) => `<div class="nmgroup"><b>${esc(k)}</b><div>${as.filter((a) => a !== k).map((a) => `<span class="chip">${esc(a)} <button type="button" class="x" data-act="nm-forget" data-kind="same" data-v="${esc(a)}" aria-label="Unlink ${esc(a)}">×</button></span>`).join('') || '<small class="muted">only itself</small>'}</div></div>`).join('')}
@@ -525,15 +696,16 @@ export function settings(db) {
     ${(() => { const st = db.settings, custom = st.customTypes || {}, n = (k) => db.accounts.filter((a) => !a.deleted && a.type === k).length;
       return `<section id="atypes"><h2>Account types</h2><p class="hint">Rename any type, or add your own, for example "Money owed to me" or "Savings pot". Choose whether a new type is something you have or something you owe.</p>
       ${Object.entries(typeNames).map(([k, l]) => `<div class="field inline"><input data-atype-label="${esc(k)}" value="${esc(l)}" aria-label="Name of ${esc(l)}"><small class="muted">${n(k)} account${n(k) === 1 ? '' : 's'}${custom[k] ? (custom[k].liab ? ' · liability' : ' · asset') : ''}</small>${custom[k] ? `<button type="button" class="btn sm ghost" data-act="atype-del" data-k="${esc(k)}">Delete</button>` : ''}</div>`).join('')}
-      <div class="field"><span>New account type</span><input id="atype-new" placeholder="e.g. Money owed to me" data-noclear="1"></div>
-      <label class="field inline"><span>It is</span><select id="atype-kind"><option value="asset">An asset (money I have or am owed)</option><option value="liab">A liability (money I owe)</option></select></label>
-      <button type="button" class="btn" data-act="atype-add">Add account type</button></section>`; })()}
+      <div class="field"><span>New account type</span><div class="atyperow"><input id="atype-new" placeholder="e.g. Savings pot" data-noclear="1" aria-label="New account type name"><select id="atype-kind" aria-label="Asset or liability"><option value="asset">Asset (I have)</option><option value="liab">Liability (I owe)</option></select><button type="button" class="btn sm" data-act="atype-add">Add</button></div></div></section>`; })()}
     ${arrangeSection(db)}
     <section><h2>Appearance</h2>
       <label class="check"><input type="checkbox" data-act="commas" ${localStorage.getItem('sukli.commas') === '0' ? '' : 'checked'}> Show thousands separators when typing (119,000)</label>
       <p class="hint">These are kept on this device only.</p>
       <div class="field"><span>Theme</span>${segBtns('look', 'theme', [['auto', 'Automatic'], ['light', 'Light'], ['dark', 'Dark']], lk.theme)}</div>
       <div class="field"><span>Colour</span><div class="swatches" role="group" aria-label="Accent colour">${Object.entries(ACCENTS).map(([k, v]) => `<button type="button" class="swatch ${lk.accent === k ? 'on' : ''}" data-act="look" data-k="accent" data-v="${k}" style="background:${v.l[0]}" aria-label="${v.n}" aria-pressed="${lk.accent === k}"></button>`).join('')}</div></div>
+      <div class="field"><span>“Spent each day” chart on Home</span><div class="seg two small" role="group" aria-label="Chart direction">${[['v', 'Vertical bars'], ['h', 'Horizontal bars']].map(([v, l]) => `<button type="button" data-act="week-mode" data-v="${v}" class="${weekMode() === v ? 'on' : ''}" aria-pressed="${weekMode() === v}">${l}</button>`).join('')}</div></div>
+      <div class="field"><span>Tap feedback</span>${(() => { const c = feedbackCfg(); return `<label class="check"><input type="checkbox" data-fb="haptic" ${c.haptic ? 'checked' : ''}> Vibrate a little when I tap</label><label class="check"><input type="checkbox" data-fb="visual" ${c.visual ? 'checked' : ''}> Flash the button I tapped</label><label class="check"><input type="checkbox" data-fb="sound" ${c.sound ? 'checked' : ''}> Soft click sound</label>`; })()}
+        <small class="hint">Some iPhones and browsers cannot vibrate, so the flash (and the click, if you turn it on) tells you the tap worked.</small></div>
       <div class="field"><span>Text size</span>${segBtns('look', 'size', SIZES.map((x) => [x[0], x[1]]), lk.size)}
         <small class="hint">Smaller text leaves more room above the on-screen keyboard.</small></div>
       <div class="field"><span>When amounts are hidden (the eye button)</span>${segBtns('hidestyle', 'style', [['dot', 'Dots  ₱•••••'], ['blur', 'Blur']], priv.style)}</div>
@@ -546,7 +718,7 @@ export function settings(db) {
     <section><h2>Display</h2>
       <label class="check"><input type="checkbox" id="showhome" ${s.showHome === false ? '' : 'checked'}> Show the ${HOME} equivalent next to other currencies</label>
       <p class="hint">For example a ¥1,200 lunch shows a small “≈ ₱…” under it. The eye button at the top hides every amount on screen, handy in public. It is remembered on this device only.</p></section>
-    <section><h2>Cloud sync</h2>
+    ${REMOVED_UI ? `<section><h2>Cloud sync</h2>
       <p class="hint">Keeps your phone and your Mac in step through your own free Supabase project. Only you can read your rows. <a href="#" data-act="cloud-setup" class="linkbtn">Set up Supabase (5 minutes)</a></p>
       ${configured() ? '<p class="hint">Project connected (from config.js).</p>' : `<label class="field"><span>Project URL</span><input id="c-url" value="${esc(cl.url || '')}" placeholder="https://abcdxyz.supabase.co" autocomplete="off" spellcheck="false" inputmode="url"></label>
       <label class="field"><span>Public (anon) key</span><input id="c-key" value="${esc(cl.key || '')}" placeholder="eyJ…" autocomplete="off" spellcheck="false"></label>`}
@@ -559,13 +731,14 @@ export function settings(db) {
         <label class="field"><span>Password</span><input id="c-pass" type="password" autocomplete="current-password"></label>
         <div class="btnrow left"><button class="btn" data-act="cloud-signin">Sign in</button><button class="btn ghost" data-act="cloud-signup">Create account</button></div>`}
       <p class="status" id="cloudstatus" role="status">${esc(cloudStatus.text || (me && lastOk() ? 'Last synced ' + new Date(lastOk()).toLocaleString() : ''))}</p></section>
+` : ''}
     ${backupSection(db)}
-    <section><h2>Google backup (optional)</h2>
+    ${REMOVED_UI ? `<section><h2>Google backup (optional)</h2>
       <p class="hint">Backs up to a private, hidden folder in your own Google Drive and keeps both your phones in step. Nothing else in your Drive is touched. <a href="#" data-act="gsetup" class="linkbtn">How to get a client ID</a></p>
       <label class="field"><span>Google client ID</span><input id="clientid" value="${esc(s.driveClientId)}" placeholder="1234-abc.apps.googleusercontent.com" autocomplete="off" spellcheck="false"></label>
       <label class="check"><input type="checkbox" id="autosync" ${s.autoSync ? 'checked' : ''}> Back up automatically after changes</label>
       <div class="btnrow left"><button class="btn" data-act="sync">Back up now</button></div>
-      <p class="status" id="syncstatus" role="status">${esc(syncStatus.text || (s.lastSync ? 'Last backup ' + new Date(s.lastSync).toLocaleString() : 'Not backed up yet.'))}</p></section>
+      <p class="status" id="syncstatus" role="status">${esc(syncStatus.text || (s.lastSync ? 'Last backup ' + new Date(s.lastSync).toLocaleString() : 'Not backed up yet.'))}</p></section>` : ''}
     <section><h2>Your data</h2>
       <div class="btnstack">
         <label class="btn ghost filebtn">Import Bluecoins CSV<input type="file" id="file-bc" accept=".csv,text/csv" hidden></label>
@@ -590,10 +763,8 @@ export function settings(db) {
       <div class="btnrow left"><button class="btn ghost sm" data-act="rates-now">Update now</button></div>
       <p class="status" id="ratesstatus" role="status">${esc(ratesStatus.text || (s.live ? 'Last updated ' + new Date(s.live.ts).toLocaleString() : 'Not updated yet.'))}</p>
       <p class="hint">Rates are used for new entries and for today’s balances. An entry you saved keeps the rate it was saved with, so old reports do not change. Type a rate below to override the live one; tap ✕ to go back to live. ${esc(RATE_CREDIT)}.</p>
-      ${curs.map((c) => { const ov = !!(s.rates && s.rates[c] > 0); const r = homeFx(db, c); return `<div class="ratebox"><label class="field inline"><span>1 ${c} =</span><input data-rate="${c}" inputmode="decimal" value="${r ? Number(r.toPrecision(6)) : ''}"><span>${HOME}</span></label>
-      <label class="field inline"><span>1 ${HOME} =</span><input data-rate-inv="${c}" inputmode="decimal" value="${r ? Number((1 / r).toPrecision(6)) : ''}"><span>${c}</span></label>
-      <small class="muted">${ov ? 'Manual rate' : (hasLive(c) ? 'Live rate' : 'From your latest entry')}</small>${ov ? `<button type="button" class="linkbtn" data-act="rate-live" data-c="${c}">✕ Use live</button>` : ''}</div>`; }).join('')}
-      <p class="hint">Edit either side: the other follows. Each entry also lets you type the ${HOME} value from your bill.</p></section>
+      ${curs.map((c) => `<div class="ratebox">${fxBlockHtml({ from: c, to: HOME, amount: 0, rate: homeFx(db, c), open: `data-act="rate-open" data-c="${c}"`, db })}</div>`).join('')}
+      <p class="hint">Tap “Exchange Rate” to convert an amount, type your own rate, or get the latest one. Each entry also lets you set the ${HOME} value from your bill.</p></section>
     <section><h2>Put it on your phone</h2><p class="hint">iPhone: open this page in Safari, tap Share, then Add to Home Screen. Android: open the browser menu and choose Install app. It then works without a connection.</p></section>
     <section><h2>Erase</h2><button class="btn danger ghost" data-act="erase">Erase everything on this device</button>
       <p class="hint">Backups in your Google Drive are not touched.</p></section>`);
@@ -617,27 +788,26 @@ export function bindSettings() {
   const ca = document.getElementById('c-auto');
   if (ca) ca.onchange = () => commit((d) => { d.settings.cloud = { ...(d.settings.cloud || {}), auto: ca.checked }; });
   const hp = document.getElementById('homeplace');
+  const wp = document.getElementById('workplace');
+  if (wp) wp.onchange = () => commitQuiet((d) => { d.settings.workPlace = wp.value.trim(); });
   if (hp) hp.onchange = () => commitQuiet((d) => { d.settings.homePlace = hp.value.trim(); });
   const cid = document.getElementById('clientid');
   if (cid) cid.onchange = () => commitQuiet((d) => { d.settings.driveClientId = cid.value.trim(); });
   const as = document.getElementById('autosync');
   if (as) as.onchange = () => commit((d) => { d.settings.autoSync = as.checked; });
-  const setRate = (cur, v, from) => {          // v is HOME per unit as typed; stored as ledger per unit
-    commitQuiet((d) => { const hr = (d.settings.rates && d.settings.rates[HOME] > 0 ? d.settings.rates[HOME] : rateFor(d, HOME)) || 1; if (v > 0) d.settings.rates[cur] = v * (HOME === BASE ? 1 : hr); else delete d.settings.rates[cur]; });
-    const other = document.querySelector(from === 'rate' ? `[data-rate-inv="${cur}"]` : `[data-rate="${cur}"]`);
-    if (other) other.value = v > 0 ? Number((from === 'rate' ? 1 / v : v).toPrecision(6)) : '';
-  };
-  document.querySelectorAll('[data-rate]').forEach((i) => { i.onchange = () => setRate(i.dataset.rate, parseFloat(i.value), 'rate'); });
-  document.querySelectorAll('[data-rate-inv]').forEach((i) => { i.onchange = () => { const x = parseFloat(i.value); setRate(i.dataset.rateInv, x > 0 ? 1 / x : 0, 'inv'); }; });
   const bc = document.getElementById('file-bc');
   if (bc) bc.onchange = async () => {
     const file = bc.files[0]; if (!file) return;
     try {
-      const text = await file.text(); let st;
-      commit((d) => { st = importBluecoins(d, text); });
+      const text = await file.text();
+      const pv = previewImport(get(), text);
+      const choice = await confirmImport(pv);
+      if (!choice) { bc.value = ''; return; }
+      let st;
+      commit((d) => { st = importBluecoins(d, text, choice); });
       window.dispatchEvent(new Event('sukli-latest'));
-      toast(`Imported ${st.added} entries, skipped ${st.skipped} already here. ${st.accounts} new accounts.`, { ms: 7000 });
-      openAccountSetup();
+      toast(`Imported ${st.added} entries, skipped ${st.skipped} already here. ${st.accounts} new accounts. Existing accounts were not changed.${st.openingFilled ? ` Filled ${st.openingFilled} empty opening balance${st.openingFilled > 1 ? 's' : ''}.` : ''}${st.noOpening ? ` ${st.noOpening} accounts have no opening balance in this file; set it in the account if their balance looks off.` : ''}`, { ms: 12000 });
+      if (st.accounts) openAccountSetup();
     } catch (e) { toast(e.message, { ms: 9000 }); }
     bc.value = '';
   };
@@ -686,8 +856,8 @@ ACT.sync = async () => {
   if (cid && cid.value.trim() !== get().settings.driveClientId) commitQuiet((d) => { d.settings.driveClientId = cid.value.trim(); });
   try { await syncNow({ interactive: true }); toast('Backed up to Google Drive.'); } catch (e) { toast(e.message, { ms: 9000 }); }
 };
-ACT['export-csv'] = () => download(`sukli-${nowStamp().slice(0, 10)}.csv`, exportCSV(get()));
-ACT['export-json'] = () => download(`sukli-backup-${nowStamp().slice(0, 10)}.json`, JSON.stringify({ ...get(), settings: { ...get().settings, driveClientId: '' } }), 'application/json');
+ACT['export-csv'] = () => download(`sukli-${fileStamp()}.csv`, exportCSV(get()));
+ACT['export-json'] = () => download(`sukli-backup-${fileStamp()}.json`, JSON.stringify({ ...get(), settings: { ...get().settings, driveClientId: '' } }), 'application/json');
 ACT.exclude = (el) => commit((d) => {
   const set = new Set(d.settings.excludeGroups);
   el.checked ? set.add(el.dataset.g) : set.delete(el.dataset.g);
@@ -777,27 +947,28 @@ ACT['nm-focus'] = (el) => mapSheet(el.dataset.k);
 
 // Settings, grouped by what they are for. Advanced items sit in their own folded group.
 const SET_GROUPS = [
-  ['look', 'Look and feel', 'Tabs, Home cards, colours, text size', ['Tabs and Home cards', 'Appearance', 'Display']],
-  ['money', 'Money and alerts', 'Home currency, spending warnings', ['Currency', 'Spending safety', 'Left out of cash outflow']],
-  ['organise', 'Accounts, categories and names', 'How things are sorted and matched', ['Categories', 'Account types', 'Name matching']],
-  ['data', 'Backup and data', 'Reminders, backups, export', ['Backup reminder', 'Your data', 'Google backup (optional)']],
+  ['look', 'Look and Feel', 'Tabs, Home cards, colours, text size', ['Tabs and Home cards', 'Appearance', 'Display']],
+  ['money', 'Money and Alerts', 'Home currency, spending warnings', ['Currency', 'Spending safety', 'Left out of cash outflow']],
+  ['organise', 'Accounts and Names', 'How things are sorted and matched', ['Categories', 'Account types', 'Name matching']],
+  ['data', 'Backup and Data', 'Reminders, backups, export', ['Backup reminder', 'Your data', 'Google backup (optional)']],
   ['adv', 'Advanced', 'Most people never need these', ['Exchange rates', 'Live exchange rates', 'Coins and tokens: decimals', 'Cloud sync', 'Erase']],
   ['help', 'Help', 'Install on your phone', ['Put it on your phone']],
 ];
 const SET_OPEN = new Set(['look']);
 document.addEventListener('toggle', (e) => { const g = e.target.dataset && e.target.dataset.sgroup; if (g) { if (e.target.open) SET_OPEN.add(g); else SET_OPEN.delete(g); } }, true);
+const titleCase = (t) => t.split(' ').map((w, i) => (i && ['and', 'or', 'of', 'the', 'to', 'on', 'in'].includes(w)) ? w : w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
 function settingsGrouped(html) {
   const i = html.indexOf('<section'); if (i < 0) return html;
   const head = html.slice(0, i), secs = [...html.slice(i).matchAll(/<section[\s\S]*?<\/section>/g)].map((m) => m[0]);
   const title = (x) => ((x.match(/<h2>([^<]*)<\/h2>/) || [])[1] || '').trim();
   const by = new Map(SET_GROUPS.map((g) => [g[0], []]));
-  for (const sec of secs) { const t = title(sec), g = SET_GROUPS.find((x) => x[3].includes(t)) || SET_GROUPS.find((x) => x[0] === 'adv'); by.get(g[0]).push(sec); }
+  for (const sec of secs) { const t = title(sec), g = SET_GROUPS.find((x) => x[3].includes(t)) || SET_GROUPS.find((x) => x[0] === 'adv'); by.get(g[0]).push(sec.replace(/<h2>([^<]*)<\/h2>/, (m, h) => '<h2>' + titleCase(h) + '</h2>')); }
   const ver = `<p class="hint verline" id="appver">Sukli version ${versionText()}</p>`;
   return head + SET_GROUPS.filter((g) => by.get(g[0]).length).map(([k, name, desc]) => `<details class="sgroup" data-sgroup="${k}" ${SET_OPEN.has(k) ? 'open' : ''}><summary><b>${name}</b><small>${desc}</small></summary>${by.get(k).join('')}</details>`).join('') + ver;
 }
 
 // ---------------- Arrange tabs and Home cards (Settings) ----------------
-export const TAB_DEFS = { home: ['Home', 'home'], ledger: ['Entries', 'list'], calendar: ['Calendar', 'calendar'], accounts: ['Accounts', 'wallet'], budget: ['Budget', 'pie'], cashflow: ['Cash flow', 'flow'], outlook: ['Outlook', 'spark'], analytics: ['Analytics', 'chart'] };
+export const TAB_DEFS = { home: ['Home', 'home'], ledger: ['Entries', 'list'], calendar: ['Calendar', 'calendar'], accounts: ['Accounts', 'wallet'], budget: ['Budget', 'pie'], cashflow: ['Cash flow', 'flow'], outlook: ['Outlook', 'spark'], analytics: ['Analytics', 'chart'], invest: ['Invest', 'spark'] };
 export const DEFAULT_TABS = ['home', 'ledger', 'calendar', 'accounts'];
 export function tabIds(db) {
   const t = ((db.settings && db.settings.tabs) || []).filter((x, i, a) => TAB_DEFS[x] && a.indexOf(x) === i).slice(0, 4);
@@ -847,9 +1018,10 @@ function projPie(db) {
   const left = inc - spent, over = left < 0, den = Math.max(inc, spent), C = 2 * Math.PI * 52; let acc = 0;
   const arcs = slices.map((x) => { const len = (x.v / den) * C, d = Math.max(0, len - 1.2);
     const el = `<circle class="slice" ${x.other ? '' : `data-act="grp" data-g="${esc(x.g)}" data-k="expense"`} data-tip="${esc(`${x.g}: ${money(x.v)} (${Math.round((x.v / inc) * 100)}% of expected income)`)}" cx="70" cy="70" r="52" fill="none" stroke="${groupColor(x.other ? 'Others' : x.g)}" stroke-width="26" stroke-dasharray="${d.toFixed(2)} ${(C - d).toFixed(2)}" stroke-dashoffset="${(-acc).toFixed(2)}" transform="rotate(-90 70 70)"></circle>`; acc += len; return el; }).join('');
+  const labels = pieLabels(slices.map((x) => x.v / den));
   const track = over ? '' : `<circle cx="70" cy="70" r="52" fill="none" stroke="var(--rule)" stroke-width="26" stroke-dasharray="${Math.max(0, (left / den) * C - 1.2).toFixed(2)} ${C.toFixed(2)}" stroke-dashoffset="${(-acc).toFixed(2)}" transform="rotate(-90 70 70)"></circle>`;
   const pct = Math.round((spent / inc) * 100);
-  return coll('h-proj', 'Spending vs expected income', `<div class="wentpie"><svg class="donut sm" viewBox="0 0 140 140" role="img" aria-label="${pct}% of expected income spent">${track}${arcs}<text x="70" y="68" text-anchor="middle" class="dv">${pct}%</text><text x="70" y="85" text-anchor="middle" class="dl">${over ? 'over income' : 'spent'}</text></svg>
+  return coll('h-proj', 'Spending vs expected income', `<div class="wentpie"><svg class="donut sm" viewBox="-30 -12 200 164" role="img" aria-label="${pct}% of expected income spent">${track}${arcs}${labels}<text x="70" y="68" text-anchor="middle" class="dv">${pct}%</text><text x="70" y="85" text-anchor="middle" class="dl">${over ? 'over income' : 'spent'}</text></svg>
     <ul class="pielegend"><li><div class="pj"><span>Expected income</span><b>${money(inc)}</b></div></li><li><div class="pj"><span>Came in so far</span><b>${money(pi.got)}</b></div></li><li><div class="pj"><span>Spent</span><b>${money(spent)}</b></div></li><li><div class="pj ${over ? 'bad' : ''}"><span>${over ? 'Over by' : 'Left'}</span><b>${money(Math.abs(left))}</b></div></li></ul></div>
     <p class="hint">${pi.own ? 'Using the income you set.' : pi.typ ? `Expected income is your usual month (middle of your last ${Math.min(3, [1, 2, 3, 4, 5, 6].filter((i) => totals(db, shiftMonth(ym, -i), 'income').total > 0).length)} months with income)${pi.got > pi.typ ? ', raised to what already came in' : ''}.` : 'No earlier months to go on, so this is what came in so far.'} Tap a slice for what is in it. <button type="button" class="linkbtn" data-act="proj-set">Set my own</button></p>`);
 }
@@ -859,3 +1031,29 @@ ACT['proj-set'] = async () => {
   if (v == null) return; const n = parseFloat(String(v).replace(/,/g, ''));
   commit((d) => { if (n > 0) d.settings.projIncome = n; else delete d.settings.projIncome; });
 };
+
+// Shows what an import will add. Existing accounts keep their type; only new ones are listed so each can be checked first.
+export function confirmImport(pv) {
+  return new Promise((res) => {
+    if (!pv.fresh.length) return res({});
+    const tn = typeNames;
+    const opt = (v) => Object.entries(tn).map(([k, n]) => `<option value="${k}" ${k === v ? 'selected' : ''}>${esc(n)}</option>`).join('');
+    const rows = pv.fresh.map((f, i) => `<div class="card" style="margin:8px 0"><b>${esc(f.name)}</b> <small class="muted">${esc(f.cur)}</small>
+      ${f.like.length ? `<p class="warn" style="margin:6px 0">⚠ Looks like your existing account <b>${esc(f.like[0].name)}</b> (${esc(tn[f.like[0].type] || f.like[0].type)}). Use that one so it stays as it is?</p>
+        <label class="row"><input type="radio" name="m${i}" value="use" checked> Use existing "${esc(f.like[0].name)}" (type not changed)</label>
+        <label class="row"><input type="radio" name="m${i}" value="new"> Create a new account</label>` : ''}
+      <label>Type <select data-t="${i}">${opt(f.type)}</select></label></div>`).join('');
+    const sh = sheet(`<p>${pv.fresh.length} new account${pv.fresh.length > 1 ? 's' : ''} would be added. Your ${pv.existing} existing accounts are not changed or re-classified.</p>${rows}
+      <div class="btnrow"><button class="btn" data-go>Import</button><button class="btn ghost" data-no>Cancel</button></div>`, { title: 'Check before importing', onClose: () => res(null) });
+    sh.el.querySelector('[data-no]').onclick = () => { sh.close(); };
+    sh.el.querySelector('[data-go]').onclick = () => {
+      const types = {}, into = {};
+      pv.fresh.forEach((f, i) => {
+        types[f.key] = sh.el.querySelector(`[data-t="${i}"]`).value;
+        const r = sh.el.querySelector(`input[name=m${i}]:checked`);
+        if (f.like.length && r && r.value === 'use') into[f.key] = f.like[0].name + '|' + f.cur;
+      });
+      sh.silent = true; sh.dispose(); res({ types, into });
+    };
+  });
+}
