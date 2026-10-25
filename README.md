@@ -1,3 +1,14 @@
+## What's new in v12.21: better receipt reading (LIFE ¥1,021 receipt)
+
+Studied a real LIFE Kawasaki Tsukagoshi receipt (¥1,021: a bag, a sticker-discounted steak, bananas, eggs, 8% tax on top). The old build read the total as **¥21** and lost every item. Now it reads shop, date, total, tax and all four items, and they add up.
+
+- **Picture:** the first reading now evens out the lighting (shadows, glare, wood-grain table) before stretching contrast; hard black-and-white is the second look. On this photo that was the most accurate image prep of everything tried.
+- **Amounts:** "¥1, 021" and "1。021" (a gap or stop where the comma is) are 1,021. "(外10% 対象 ¥5)" no longer counts the 10 of the rate as money, which made ¥5 of fake tax.
+- **Tax:** when the tax line's label is unreadable ("58% ¥75") but the printed amount fits (items + that amount = total, and it is 3 to 10% of the items), it is taken as the tax.
+- **Shop:** words only one chain prints name it when the logo is a picture: "LaCuCa" is LIFE, WAON / トップバリュ is AEON, ファミペイ is FamilyMart. The branch (川崎塚越店) comes from the header.
+- **Item names:** look-alike characters are put right against a list of everyday grocery words (軸入牛 to 輸入牛, 哲たまご to 白たまご, パナナ to バナナ), "1 OF" or "1 0個" to 10個, and a few-yen line whose name is only noise is the carrier bag. レジ袋 is no longer skipped as a "register" line.
+- **Test:** `tests/receipt-life-test.mjs` with five real OCR readings of this photo.
+
 ## What's new in v12.20 (merged with v14.3)
 
 v14.3 was compared with this build file by file. Most of it was already here in a more complete form (trips and routes, tax on interest with re-tax, receipt discounts and tax, Home and tab arrangement, rolling 7-day average with daily bars, account page + menu, swap in transfers, keyboard-aware sheets, Back scroll position), so those were kept as they are. One thing was missing and has been added:

@@ -11,7 +11,8 @@ const GAP = new RegExp(`(?<=[${CJK}])\\s+(?=[${CJK}])|(?<=\\d)\\s+(?=[${CJK}])`,
 // OCR puts spaces between Japanese characters ("ライ フ 塚越 店") and reads ¥ as a backslash: tidy both
 const NK = (s) => String(s || '').normalize('NFKC').replace(/[￥円]/g, '¥').replace(/\\(?=\s?\d)/g, '¥').replace(GAP, '')
   .replace(/(?<=[\d¥])[OoQD](?=[\d,.\s¥軽※*外内]|$)/g, '0').replace(/(?<=¥)[OoQ](?=\d)/g, '0').replace(/(?<=\d)[lI|](?=\d|\s|$)/g, '1')
-  .replace(/(?<=^|[\s*・.:])[yYvV](?=\d{2,5}(?:\D|$))/g, '¥').replace(/(?<=¥)[Il|](?=\d)/g, '1');   // ¥ read as y, Y or v; ¥I08 is ¥108
+    .replace(/(?<=\d)[,，。､]\s?(?=\d{3}(?!\d))/g, ',')                                  // "¥1, 021" and "1。021" are 1,021 (the reader leaves a gap or a stop where the comma is)
+.replace(/(?<=^|[\s*・.:])[yYvV](?=\d{2,5}(?:\D|$))/g, '¥').replace(/(?<=¥)[Il|](?=\d)/g, '1');   // ¥ read as y, Y or v; ¥I08 is ¥108
 // OCR often adds a few junk characters after the price ("¥299 【", "¥754 F ーー"): drop them when nothing numeric follows
 const trimTail = (t) => { const re = /(¥\s?-?\d[\d,]*|-?\d[\d,]*)\s*[軽※*外内E]?/g; let last = null, m; while ((m = re.exec(t))) last = m; if (!last) return t; const end = last.index + last[0].length, tail = t.slice(end); return tail && tail.length <= 14 && !/\d/.test(tail) ? t.slice(0, end).trim() : t; };
 const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
@@ -26,7 +27,32 @@ export const SHOPS = [
   ['Don Quijote', /ドン・?キホーテ|ドンキ/], ['Daiso', /ダイソー|daiso/i], ['Matsumoto Kiyoshi', /マツモトキヨシ|マツキヨ/], ['Uniqlo', /ユニクロ|uniqlo/i],
   ['SM Supermarket', /\bSM (supermarket|hypermarket)/i], ['Puregold', /puregold/i], ['Jollibee', /jollibee/i], ["McDonald's", /mcdonald|マクドナルド/i], ['Starbucks', /starbucks|スターバックス/i],
 ];
-const SKIP_ITEM = /小計|合計|総合計|お買上|お預|おあずかり|お釣|おつり|釣銭|税|対象|計|支払|残高|カード|交通|PayPay|ポイント|現金|クレジット|カード|電話|TEL|登録番号|レジ|担当|責任者|領収|点数|ご利用|ありがとう|ご来店|変更|交換|返品|レシート|No\.?|subtotal|total|change|cash|tax|vat/i;
+// not the name itself but something only that chain prints
+export const SHOP_CUES = [
+  ['LIFE', /la\s?cu\s?ca|ラ\s?ク\s?カ|スマイルライフ/i], ['AEON', /\bWAON\b|ワオン|トップバリュ|TOPVALU/i], ['FamilyMart', /ファミペイ|ファミマ|famima/i],
+  ['Maibasket', /まいばす/], ['Seiyu', /みなさまのお墨付き/],
+];
+
+// OCR swaps look-alike characters (輸→軸, 白→哲, バ→パ). A word from a list of everyday grocery words that is one look-alike character away is put right.
+const LOOK = ['輸軸輪転', '白哲百自臼', 'バパハ', 'ベペヘ', 'ビピヒ', 'ブプフ', 'ボポホ', 'ドト', 'カ力', 'トト卜', 'ロ口', 'タ夕', 'エ工', 'ニ二', '豆立', '乳孔', '鶏鳥', '卵卯'];
+const SAME = (a, b) => LOOK.some((g) => g.includes(a) && g.includes(b));
+const WORDS = ['バナナ', '白たまご', 'たまご', '輸入牛', '輸入', '国産', '牛乳', '食パン', '豆腐', '納豆', '豚バラ', '豚こま', '鶏もも', '鶏むね', 'ヨーグルト', 'チーズ', 'バター', 'キャベツ', 'にんじん', '玉ねぎ', 'じゃがいも', 'トマト', 'きゅうり', 'ほうれん草', 'もやし', 'りんご', 'みかん', 'いちご', 'ぶどう', 'レタス', 'ブロッコリー', 'しいたけ', '食卓', '毎日の', 'カット', 'ステーキ', 'ソーセージ', 'ウインナー', 'ハム', 'ベーコン', 'ジュース', '麦茶', '緑茶', '豆乳', 'ティッシュ', '洗剤', 'レジ袋', '味噌', '醤油', '砂糖', 'マヨネーズ', 'ケチャップ', 'カレー', 'ラーメン', 'うどん', 'パスタ', 'おにぎり', '弁当', 'サラダ', '刺身', 'ヨーグルト', 'アイス', 'チョコ', 'スナック', 'ビール', 'ミネラルウォーター', '食パン', 'ロースハム', 'ささみ', 'ひき肉', 'ベビー', 'ペットボトル'];
+export function repairName(name) {
+  let out = String(name || '');
+  for (const w of WORDS) {
+    const n = w.length; if (n < 2 || out.length < n) continue;
+    for (let i = 0; i + n <= out.length; i++) {
+      const seg = out.slice(i, i + n); if (seg === w) continue;
+      let bad = -1, many = false; for (let k = 0; k < n; k++) if (seg[k] !== w[k]) { if (bad >= 0) { many = true; break; } bad = k; }
+      if (many || bad < 0 || !SAME(seg[bad], w[bad])) continue;
+      if (n < 3 && !/\p{sc=Han}/u.test(w[bad])) continue;                 // two-letter words only when the odd character is a kanji
+      out = out.slice(0, i) + w + out.slice(i + n);
+    }
+  }
+  out = out.replace(/^[ァ-ヶA-Za-z]{1,3}(?=(?:レジ袋|バナナ)(?:[SMLＳＭＬ])?$)/, '');                    // a few stray letters (the logo or the ◇ mark) in front of a plain word
+  return out.replace(/(\d)\s+(\d)(?=個)/, '$1$2').replace(/(\d)\s*[Oo0]\s*[FEf]\s*$/, '$10個');                 // "10個" read as "1 OF"
+}
+const SKIP_ITEM = /小計|合計|総合計|お買上|お預|おあずかり|お釣|おつり|釣銭|税|対象|計|支払|残高|カード|交通|PayPay|ポイント|現金|クレジット|カード|電話|TEL|登録番号|レジ(?!袋)|担当|責任者|領収|点数|ご利用|ありがとう|ご来店|変更|交換|返品|レシート|No\.?|subtotal|total|change|cash|tax|vat/i;
 const TOTAL_KEY = /合[\s。.、]*計|お買上げ?計|総合計|ご請求|お支払い?金額|お会計|total|amount due/i;
 const NOT_TOTAL = /小計|内税|外税|消費税|対象|お預|お釣|釣|ポイント|sub ?total|change|tax|vat/i;
 const PRICE_END = /(?:^|[\s:*])¥?\s*(-?\s?\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|-?\s?\d+(?:\.\d{1,2})?)\s*(軽|※|\*|外|内|[A-Z])?\s*$/;
@@ -74,6 +100,11 @@ export function findMerchant(lines, known = []) {
   }
   // a name already in your history that appears in the first lines
   for (const [i, l] of head.entries()) { const t = NK(l.text).toLowerCase(); for (const k of known) if (k.length >= 4 && t.includes(k.toLowerCase())) return { value: k, branch: '', conf: 0.75, line: i, how: 'in your history' }; }
+  // words that only one chain prints (its point card, its own brand), found anywhere: the logo is a picture, but "LaCuCa" says LIFE
+  for (const [i, l] of lines.entries()) for (const [name, re] of SHOP_CUES) if (re.test(NK(l.text))) {
+    let branch = ''; for (const h of head) { const bm = NK(h.text).replace(/[^\p{L}\p{N} ]/gu, '').match(/[\p{sc=Han}ー]{2,8}店/u); if (bm) { branch = bm[0].replace(/上店$/, '店'); break; } }
+    return { value: name, branch, conf: 0.62, line: i, how: 'brand seen on a line' };
+  }
   // the shop name usually sits right above its address
   for (const [i, l] of head.entries()) {
     if (i === 0 || !/[都道府県].*[市区町村郡]|〒/.test(NK(l.text))) continue;
@@ -122,10 +153,11 @@ function priceOf(t) {
 }
 export function findItems(lines) {
   const items = []; let tax = 0, taxIncluded = false;
+  const jp = lines.some((l) => /[\p{sc=Hiragana}\p{sc=Katakana}]/u.test(l.text));
   for (const [i, l] of lines.entries()) {
     const t = trimTail(NK(l.text).trim()); if (!t) continue;
     if (/外税|外\s?\d{1,3}\s?%|消費税|\btax\b|\bvat\b/i.test(t)) {
-      const all = amountsIn(t), a = all[all.length - 1]; if (/内|うち/.test(t)) taxIncluded = true;
+      const all = amountsIn(t.replace(/\d{1,3}\s?%/g, ' ')), a = all[all.length - 1]; if (/内|うち/.test(t)) taxIncluded = true;   // "外10% 対象 ¥5": the 10 is a rate, not an amount
       if (a && /対象/.test(t) && /外/.test(t) && all.length >= 2 && a.v < all[all.length - 2].v) { tax += a.v; continue; }   // "外税 8%対象 356 28": base and tax on one line
       if (a && /外税|外\s?\d{1,3}\s?%|\btax\b|\bvat\b/i.test(t) && !/内|うち|対象/.test(t)) tax += a.v;     // tax printed on top of the item prices
       continue;
@@ -135,7 +167,8 @@ export function findItems(lines) {
     if (/20\d{2}[^\d\n]{1,2}\d{1,2}[^\d\n]{1,2}\d{1,2}|\d{1,2}\s*[:：]\s*\d{2}/.test(t) || NOT_AMOUNT.test(t)) continue;   // date, time, phone, card and register lines
     if (SKIP_ITEM.test(t) && !/値引|割引|クーポン/.test(t)) continue;
     const pr = priceOf(t); if (!pr || !pr.v) continue;
-    const name = t.slice(0, pr.at).replace(/[¥\s.:*＊]+$/, '').replace(/^[^\p{L}\p{N}-]+/u, '').replace(/^[\d\s]*(?=\D)/, '').replace(/^[*＊\s]+/, '').trim();
+    let name = repairName(t.slice(0, pr.at).replace(/[¥\s.:*＊]+$/, '').replace(/^[^\p{L}\p{N}-]+/u, '').replace(/^[\d\s]*(?=\D)/, '').replace(/^[*＊\s]+/, '').trim());
+    if (jp && pr.strong && pr.v >= 1 && pr.v <= 10 && !/値引|割引|クーポン|引/.test(name) && !/[\p{sc=Han}\p{sc=Hiragana}\p{sc=Katakana}]/u.test(name)) name = 'レジ袋';   // a few yen and a name that is only noise: the carrier bag
     const disc = /値引|割引|クーポン|引|discount/i.test(name) && !/ー$/.test(name);
     if (!pr.strong && !(goodName(name) && pr.v >= 10 && name.replace(/[^\p{L}]/gu, '').length >= (/[\p{sc=Han}\p{sc=Hiragana}\p{sc=Katakana}]/u.test(name) ? 1 : 3))) continue;   // an unmarked number is only a price when the name is clearly a word
     const pm = disc ? name.match(/(\d{1,2})\s?%/) : null, ok = goodName(name);
@@ -144,7 +177,7 @@ export function findItems(lines) {
   return { items, tax, taxIncluded };
 }
 
-const NOT_AMOUNT = /残高|カード番号|\*{3,}|登録番号|電話|TEL|レジ|セルフ|\d{2,4}-\d{2,4}-\d{3,4}/i;
+const NOT_AMOUNT = /残高|カード番号|\*{3,}|登録番号|電話|TEL|レジ(?!袋)|セルフ|\d{2,4}-\d{2,4}-\d{3,4}/i;
 const PAY_LINE = /支払|PayPay|ペイ|交通系|nanaco|WAON|Suica|PASMO|QUICPay|クレジット|電子マネー/i;
 const PAYTOTAL = /支\s*払\s*(合\s*[。.、]*\s*計|総額|金額合計)|お支払\s*合計/;
 export function findTotal(lines, items) {
@@ -207,8 +240,13 @@ export function parseReceipt(lines, { known = [], today = new Date(), settle: do
   const date = findDate(lines, today), merchant = findMerchant(lines, known);
   // items stop at the first subtotal/total line: what comes after is payment, change and tax
   const stop = lines.findIndex((l) => /小計|合計|sub ?total|^total/i.test(NK(l.text)));
-  const { items } = findItems(stop > 2 ? lines.slice(0, stop + 1) : lines), { tax, taxIncluded } = findItems(lines);
-  let total = findTotal(lines, items);
+  const { items } = findItems(stop > 2 ? lines.slice(0, stop + 1) : lines), t0 = findItems(lines), taxIncluded = t0.taxIncluded;
+  let tax = t0.tax, total = findTotal(lines, items);
+  // the tax line's label is often unreadable (\"58%  ¥75\"), but the tax is still printed: when items plus one printed amount that is 3-10% of them make the total, that amount is the tax
+  if (total && items.length && !taxIncluded) {
+    const s0 = items.reduce((a, x) => a + x.amt, 0), diff = total.value - s0, onItem = new Set(items.map((x) => x.line));
+    if (diff > 0 && Math.abs(s0 + tax - total.value) > 1 && diff >= s0 * 0.03 - 1 && diff <= s0 * 0.105 + 1 && lines.some((l, i) => !onItem.has(i) && /[%税外内]/.test(NK(l.text)) && amountsIn(trimTail(NK(l.text)).replace(/\d{1,3}\s?%/g, ' ')).some((a) => a.v === diff))) tax = diff;   // on a line that talks about tax or a rate
+  }
   const subs = findTargets(lines, total, tax);
   // the "total" that was found is only the subtotal while a tax line sits on top of it: the amount paid is subtotal + tax
   if (total && tax > 0 && !taxIncluded && total.src !== 'paytotal' && subs.some((x) => near(x, total.value))) total = { ...total, value: total.value + tax, how: 'subtotal plus tax', conf: Math.min(total.conf, 0.7) };

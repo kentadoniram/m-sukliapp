@@ -30,6 +30,14 @@ function binarise(g, w, h, win, k) {
   for (let y = 0; y < h; y++) { const y0 = Math.max(0, y - r), y1 = Math.min(h, y + r + 1); for (let x = 0; x < w; x++) { const x0 = Math.max(0, x - r), x1 = Math.min(w, x + r + 1), n = (x1 - x0) * (y1 - y0), m = (I[y1 * (w + 1) + x1] - I[y0 * (w + 1) + x1] - I[y1 * (w + 1) + x0] + I[y0 * (w + 1) + x0]) / n; out[y * w + x] = g[y * w + x] < m * k ? 0 : 255; } }
   return out;
 }
+// divide out the lighting: a shadow, a curl or a lamp glare is a slow change in brightness, the print is fast. Dividing by a blurred copy leaves just the print on an even white.
+function flatten(g, w, h, r) {
+  const I = new Float64Array((w + 1) * (h + 1));
+  for (let y = 0; y < h; y++) { let row = 0; for (let x = 0; x < w; x++) { row += g[y * w + x]; I[(y + 1) * (w + 1) + x + 1] = I[y * (w + 1) + x + 1] + row; } }
+  const out = new Uint8ClampedArray(w * h);
+  for (let y = 0; y < h; y++) { const y0 = Math.max(0, y - r), y1 = Math.min(h, y + r + 1); for (let x = 0; x < w; x++) { const x0 = Math.max(0, x - r), x1 = Math.min(w, x + r + 1), n = (x1 - x0) * (y1 - y0), m = (I[y1 * (w + 1) + x1] - I[y0 * (w + 1) + x1] - I[y1 * (w + 1) + x0] + I[y0 * (w + 1) + x0]) / n; out[y * w + x] = Math.min(255, (g[y * w + x] / Math.max(m, 1)) * 235); } }
+  return out;
+}
 // turn a bitmap by 0 / 90 / 180 / 270 degrees clockwise
 function turn(bmp, deg) {
   if (!deg) return bmp;
@@ -55,7 +63,7 @@ export async function textAxis(file) {
   const rr = rough(rows), rc = rough(cols);
   return { axis: rr >= rc ? 'h' : 'v', rows: rr, cols: rc };
 }
-export async function prepareReceipt(file, { target = 1500, k = 0.86, crop = true, binarise: bin = true, rot = 0 } = {}) {
+export async function prepareReceipt(file, { target = 1500, k = 0.86, crop = true, binarise: bin = true, rot = 0, flat = false } = {}) {
   const bmp0 = await createImageBitmap(file, { imageOrientation: 'from-image' }).catch(() => createImageBitmap(file));
   const bmp = turn(bmp0, rot);
   const s0 = Math.min(1, 1100 / Math.max(bmp.width, bmp.height)), aw = Math.round(bmp.width * s0), ah = Math.round(bmp.height * s0);
@@ -69,13 +77,15 @@ export async function prepareReceipt(file, { target = 1500, k = 0.86, crop = tru
   g.drawImage(bmp, box.x * sx, box.y * sx, sw, sh, 20, 20, W, H);
   const im = g.getImageData(0, 0, c.width, c.height), d = im.data, gray = new Uint8Array(c.width * c.height);
   for (let i = 0; i < gray.length; i++) gray[i] = (d[i * 4] * 0.299 + d[i * 4 + 1] * 0.587 + d[i * 4 + 2] * 0.114) | 0;
+  const cw = c.width, ch = c.height;
+  const src = flat && !bin ? flatten(gray, cw, ch, Math.max(20, Math.round(cw / 40))) : gray;      // flat: even out shadows before the contrast stretch
   let bw;
   if (bin) bw = binarise(gray, c.width, c.height, Math.max(25, Math.round(c.width / 18)) | 1, k);
   else {                                                   // soft grey: stretch the contrast but keep the strokes smooth
-    bw = new Uint8ClampedArray(gray.length); const hist = new Uint32Array(256); for (const v of gray) hist[v]++;
-    let a = 0, lo = 0; for (; lo < 255; lo++) { a += hist[lo]; if (a > gray.length * 0.01) break; }
-    a = 0; let hi = 255; for (; hi > 0; hi--) { a += hist[hi]; if (a > gray.length * 0.35) break; }
-    const span = Math.max(40, hi - lo); for (let i = 0; i < gray.length; i++) bw[i] = Math.max(0, Math.min(255, ((gray[i] - lo) * 255) / span));
+    bw = new Uint8ClampedArray(src.length); const hist = new Uint32Array(256); for (const v of src) hist[v]++;
+    let a = 0, lo = 0; for (; lo < 255; lo++) { a += hist[lo]; if (a > src.length * 0.01) break; }
+    a = 0; let hi = 255; for (; hi > 0; hi--) { a += hist[hi]; if (a > src.length * 0.35) break; }
+    const span = Math.max(40, hi - lo); for (let i = 0; i < src.length; i++) bw[i] = Math.max(0, Math.min(255, ((src[i] - lo) * 255) / span));
   }
   for (let i = 0; i < bw.length; i++) d[i * 4] = d[i * 4 + 1] = d[i * 4 + 2] = bw[i];
   g.putImageData(im, 0, 0);

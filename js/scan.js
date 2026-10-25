@@ -196,11 +196,12 @@ export async function readReceiptFile(file, status = () => {}, { forceSecond = f
   status('Preparing the picture…');
   const w = await engine(status);
   const { rot, scores } = await findRotation(file, w, status);
-  const canvas = await prepareReceipt(file, { rot }), grey = await prepareReceipt(file, { binarise: false, rot });
-  const known = knownNames(get()), a = await readCanvas(w, canvas, status, 'Reading', 0.02, 0.55), la = a.lines, p1 = parseReceipt(la, { known });
+  // first look: soft grey with the lighting evened out (shadows, glare, a wood-grain table) read best in tests; second look: hard black and white
+  const grey = await prepareReceipt(file, { binarise: false, flat: true, rot }), canvas = await prepareReceipt(file, { rot });
+  const known = knownNames(get()), a = await readCanvas(w, grey, status, 'Reading', 0.02, 0.55), la = a.lines, p1 = parseReceipt(la, { known });
   const good = !forceSecond && p1.total && p1.total.conf >= 0.85 && p1.date && p1.check && p1.check.ok && p1.items.length && !p1.items[0].whole;   // everything agrees: skip the slower second look
   let lb = null;
-  if (!good) { const b = await readCanvas(w, grey, status, 'Second look', 0.55, 0.95).catch(() => null); lb = b ? b.lines : null; }
+  if (!good) { const b = await readCanvas(w, canvas, status, 'Second look', 0.55, 0.95).catch(() => null); lb = b ? b.lines : null; }
   const parsed = parseBoth(la, lb, { known });
   return { rot, scores, parsed, lines: la, first: la, second: lb, url: grey.toDataURL('image/jpeg', 0.5), conf: a.conf, canvas, grey };
 }
